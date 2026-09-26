@@ -1706,6 +1706,40 @@ async function purgeOrphanClones(staleHours: number): Promise<{ count: number; b
   return { count: removed.length, bytes, names: removed };
 }
 
+/**
+ * #5484: coordinated purge of expired tombstones on a managed brain. Pages in
+ * archived sources are left to the source-lifecycle purge. A page that cannot
+ * be purged (owner unavailable, revision moved) is reported, never forced.
+ */
+async function purgeExpiredPagesManaged(engine: BrainEngine, olderThanHours: number):
+  Promise<{ slugs: string[]; count: number; blocked: Array<{ source_id: string; slug: string; reason: string }> }> {
+  const { submitPageMutation } = await import('./persistence/page-mutations.ts');
+  const { loadConfig } = await import('./config.ts');
+  const { randomUUID } = await import('node:crypto');
+  const hours = Math.max(0, Math.floor(olderThanHours));
+  const rows = await engine.executeRaw<{ source_id: string; slug: string }>(
+    `SELECT p.source_id, p.slug FROM pages p JOIN sources s ON s.id = p.source_id
+      WHERE p.deleted_at IS NOT NULL AND p.deleted_at < now() - ($1 || ' hours')::interval AND NOT s.archived
+      ORDER BY p.deleted_at ASC, p.source_id ASC, p.slug ASC`, [String(hours)]);
+  const config = loadConfig() ?? { engine: engine.kind };
+  const slugs: string[] = [];
+  const blocked: Array<{ source_id: string; slug: string; reason: string }> = [];
+  for (const row of rows) {
+    try {
+      const snapshot = await engine.readPageSnapshot(row.slug, { sourceId: row.source_id, includeDeleted: true });
+      if (!snapshot?.page.deleted_at) continue; // restored or already gone since the scan
+      await submitPageMutation({ engine, config, remote: false, sourceId: row.source_id, dryRun: false,
+        logger: { info() {}, warn() {}, error() {} } } as never,
+        { operation: 'delete_page', params: { slug: row.slug, source_id: row.source_id, purge: true,
+          expected_revision: snapshot.revision, request_id: randomUUID() } });
+      slugs.push(row.slug);
+    } catch (error) {
+      blocked.push({ ...row, reason: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  return { slugs, count: slugs.length, blocked };
+}
+
 async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<PhaseResult> {
   try {
     if (dryRun) {
@@ -1722,7 +1756,12 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
     // oauth_client, v64) is reported and skipped instead of aborting the sweep.
     const purgeResult = await purgeExpiredSources(engine);
     const purgedSources = purgeResult.purged;
-    const purgedPages = await engine.purgeDeletedPages(SOFT_DELETE_TTL_HOURS_FOR_PURGE);
+    const { managedPersistenceEnabled } = await import('./persistence/ownership.ts');
+    // #5484: a managed brain refuses the raw engine DELETE; each expired
+    // tombstone is purged through the coordinated delete_page protocol.
+    const managedPurge = await managedPersistenceEnabled(engine)
+      ? await purgeExpiredPagesManaged(engine, SOFT_DELETE_TTL_HOURS_FOR_PURGE) : null;
+    const purgedPages = managedPurge ?? await engine.purgeDeletedPages(SOFT_DELETE_TTL_HOURS_FOR_PURGE);
     const purgedClones = await purgeOrphanClones(SOFT_DELETE_TTL_HOURS_FOR_PURGE);
     // v0.36+ folded scope item +C: GC stale op_checkpoints rows.
     // 7-day TTL is deliberately generous; any reasonable long-running op
@@ -1772,7 +1811,8 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
       summary:
         `purged ${purgedSources.length} source(s)` +
         (purgeResult.blocked.length > 0 ? ` (${purgeResult.blocked.length} FK-blocked, see details)` : '') +
-        `, ${purgedPages.count} page(s), ` +
+        `, ${purgedPages.count} page(s)` +
+        (managedPurge?.blocked.length ? ` (${managedPurge.blocked.length} page(s) held, see details)` : '') + ', ' +
         `${purgedClones.count} orphan clone temp dir(s), ${purgedCheckpoints} stale op_checkpoint(s), ` +
         `${purgedBrainstormCheckpoints} stale brainstorm checkpoint(s), ` +
         `${purgedBatchRetryAuditFiles} stale batch-retry audit file(s), ` +
@@ -1785,6 +1825,7 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
         purged_orphan_clone_names: purgedClones.names,
         purged_sources: purgedSources,
         purged_page_slugs: purgedPages.slugs,
+        ...(managedPurge ? { purged_pages_blocked: managedPurge.blocked } : {}),
         purged_checkpoints_count: purgedCheckpoints,
         purged_brainstorm_checkpoints_count: purgedBrainstormCheckpoints,
         purged_batch_retry_audit_files_count: purgedBatchRetryAuditFiles,

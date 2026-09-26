@@ -34,6 +34,8 @@ import { createGlobalLlmHaltTracker, haltedClassOf, type GlobalLlmErrorClass } f
 // source-boost's 1.3× 'concepts/' weighting can actually reach them.
 import { importFromContent } from '../import-file.ts';
 import { serializeMarkdown } from '../markdown.ts';
+import { maintenancePreflight, publishMaintenancePage, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
+import { isDbOnly, loadStorageConfig } from '../storage-config.ts';
 import { canonicalLookup, type ModelPricing } from '../model-pricing.ts';
 
 const DEFAULT_BUDGET_USD = 1.5;
@@ -275,6 +277,11 @@ export async function runPhaseSynthesizeConcepts(
     fallback: 'sonnet',
   });
   const synthMaxOutputTokens = resolveSynthMaxOutputTokens(synthModel);
+  // #5484: a managed brain refuses the legacy importFromContent writer. Claim
+  // maintenance authority before any model work so a missing canonical owner
+  // fails fast instead of after the spend; null on an unmanaged brain.
+  const maintenance: MaintenanceAuthority | null = opts.dryRun || atomGroups.length === 0
+    ? null : await maintenancePreflight(engine, opts.sourceId ?? 'default', opts.brainDir);
   for (const group of atomGroups) {
     tierCounts[group.tier]++;
     let narrative: string;
@@ -373,11 +380,15 @@ export async function runPhaseSynthesizeConcepts(
         { type: 'concept', title: title.replace(/-/g, ' '), tags: [] },
       );
       const conceptSlug = `concepts/${title}`;
-      await importFromContent(engine, conceptSlug, md, {
-        noEmbed: !isAvailable('embedding'),
-        // #4416: target the cycle's resolved source, not the 'default' literal.
-        sourceId: opts.sourceId,
-      });
+      if (maintenance) {
+        await publishManagedConcept(engine, maintenance, conceptSlug, md, opts.brainDir);
+      } else {
+        await importFromContent(engine, conceptSlug, md, {
+          noEmbed: !isAvailable('embedding'),
+          // #4416: target the cycle's resolved source, not the 'default' literal.
+          sourceId: opts.sourceId,
+        });
+      }
       // #4589: bank concept<->member-atom provenance edges. The prompt forbids
       // enumerating atoms in the body and no frontmatter field maps to a link
       // verb, so without this every concept page lands with zero edges (graph
@@ -425,7 +436,9 @@ export async function runPhaseSynthesizeConcepts(
   // survives only as the fallback for legacy unscoped callers. Receipt only
   // fires when concepts were actually written; rollup always fires so doctor
   // sees the phase ran.
-  if (!opts.dryRun && conceptsWritten > 0) {
+  // Managed brains skip the receipt page (a legacy putPage), exactly like
+  // extract_atoms; the rollup row below still records the run for doctor.
+  if (!opts.dryRun && !maintenance && conceptsWritten > 0) {
     const runId = `concepts-${Date.now().toString(36)}`;
     try {
       await writeReceipt(engine, {
@@ -480,6 +493,30 @@ export async function runPhaseSynthesizeConcepts(
       dry_run: opts.dryRun ?? false,
     },
   };
+}
+
+/**
+ * #5484: publish one concept page through the canonical coordinator. A concept
+ * keeps the storage shape it already has. A row with a recorded source file is
+ * republished to that file (a DB-only update would leave the file stale for the
+ * next sync to resurrect). New concepts and file-less rows stay DB-only, which
+ * is what the legacy importFromContent writer produced (see
+ * DERIVE_PHASE_DB_ONLY_DEFAULTS). A declared `db_only` tier always wins.
+ */
+async function publishManagedConcept(engine: BrainEngine, authority: MaintenanceAuthority,
+  slug: string, markdown: string, brainDir?: string): Promise<void> {
+  const snapshot = await engine.readPageSnapshot(slug, { sourceId: authority.writer.sourceId, includeDeleted: true });
+  let dbOnly = !snapshot?.page.source_path;
+  if (!dbOnly) {
+    try {
+      const storage = loadStorageConfig(brainDir);
+      dbOnly = storage !== null && isDbOnly(slug, storage);
+    } catch {
+      // Unreadable gbrain.yml: keep the recorded file; sync reports the config.
+    }
+  }
+  await publishMaintenancePage(engine, authority, slug, markdown,
+    { expectedRevision: snapshot?.revision ?? null, file: !dbOnly });
 }
 
 /**
