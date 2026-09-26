@@ -92,11 +92,16 @@ async function submitMaintenance(engine: BrainEngine, authority: MaintenanceAuth
   return writeResponse(await waitForWrite(engine, row, loadConfig() ?? { engine: engine.kind }));
 }
 
+/** #5523: a Life Chronicle timeline row projected onto the depth page in the same publication. */
+export interface MaintenanceEventProjection { depth_slug: string; date: string; summary: string; }
+
 export async function publishMaintenancePage(engine: BrainEngine, authority: MaintenanceAuthority, slug: string,
-  content: string, options: { requestId?: string; expectedRevision: string | null; file?: boolean }): Promise<Record<string, unknown>> {
+  content: string, options: { requestId?: string; expectedRevision: string | null; file?: boolean;
+    eventProjection?: MaintenanceEventProjection }): Promise<Record<string, unknown>> {
+  const projection = options.eventProjection ? { event_projection: options.eventProjection } : {};
   return submitMaintenance(engine, authority, slug, { kind: 'managed_maintenance_page', content,
-    expected_revision: options.expectedRevision }, options.requestId ?? maintenanceRequestId({ authority: authority.writer,
-    slug, content, revision: options.expectedRevision, file: options.file ?? true }), options.file);
+    expected_revision: options.expectedRevision, ...projection }, options.requestId ?? maintenanceRequestId({ authority: authority.writer,
+    slug, content, revision: options.expectedRevision, file: options.file ?? true, ...projection }), options.file);
 }
 
 export async function stampMaintenancePage(engine: BrainEngine, authority: MaintenanceAuthority, slug: string,
@@ -168,8 +173,22 @@ export async function submitMaintenanceConsolidation(engine: BrainEngine, author
 
 export async function prepareMaintenanceMutation(engine: BrainEngine, row: WriteRequest, config: GBrainConfig): Promise<PreparedMutation> {
   if (row.authority.remote) throw new OperationError('permission_denied', 'Remote maintenance publication is not supported.');
-  if (row.intent?.kind === 'managed_maintenance_page') return preparePageMutation(engine, row.intent.expected_revision === null
-    ? { ...row, intent: { ...row.intent, expected_revision: undefined } } : row, config);
+  if (row.intent?.kind === 'managed_maintenance_page') {
+    const prepared = await preparePageMutation(engine, row.intent.expected_revision === null
+      ? { ...row, intent: { ...row.intent, expected_revision: undefined } } : row, config);
+    const projection = row.intent.event_projection as MaintenanceEventProjection | undefined;
+    if (!projection) return prepared;
+    // #5523: the event page and its depth-page timeline row commit together
+    // (the coordinator applies inside one source-scoped transaction); a
+    // missing depth page projects nothing, exactly like the legacy writer.
+    return { ...prepared, additionalPageKeys: [...(prepared.additionalPageKeys ?? []),
+      { sourceId: row.source_id, slug: projection.depth_slug }], apply: async tx => {
+      const outcome = await prepared.apply(tx);
+      const { projected } = await tx.upsertEventProjection({ depthSlug: projection.depth_slug, eventSlug: row.slug,
+        date: projection.date, summary: projection.summary, sourceId: row.source_id });
+      return { ...outcome, event_projected: projected };
+    } };
+  }
   if (row.intent?.kind !== 'managed_maintenance_consolidate') throw new OperationError('invalid_params', 'Unsupported maintenance request.');
   const p = row.intent;
   const facts = p.facts as FactSnapshot[];
