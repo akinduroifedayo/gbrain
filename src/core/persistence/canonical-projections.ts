@@ -2,43 +2,58 @@ import type { BrainEngine } from '../engine.ts';
 import type { ParsedPage } from '../import-file.ts';
 import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, parseFactsFence } from '../facts-fence.ts';
 import { TAKES_FENCE_BEGIN, TAKES_FENCE_END, parseTakesFence } from '../takes-fence.ts';
-import { extractFactsFromFenceText } from '../facts/extract-from-fence.ts';
+import { extractFactsFromFenceText, type FenceExtractedFact } from '../facts/extract-from-fence.ts';
 import { takesPreparation } from '../takes-write.ts';
 import { parseTimelineEntries } from '../link-extraction.ts';
 import { extractTimelineFromContent } from '../timeline-extract.ts';
 import { sanitizeRemoteBody } from '../remote-body.ts';
 import { OperationError } from '../ops/contract.ts';
 
-/** Compile synchronous, provider-free projections before entering publication. */
-export function prepareCanonicalProjections(page: ParsedPage, slug: string, sourceId: string): (tx: BrainEngine) => Promise<void> {
-  const fields=[page.compiled_truth,page.timeline ?? ''];
+function assertSingleFences(fields: string[]): void {
   for(const field of fields) for(const marker of [FACTS_FENCE_BEGIN,FACTS_FENCE_END,TAKES_FENCE_BEGIN,TAKES_FENCE_END]) {
     if(field.split(marker).length>2) throw new OperationError('invalid_params','Each canonical body section must contain at most one facts fence and one takes fence.');
   }
-  const factSets=fields.map(parseFactsFence),takeSets=fields.map(parseTakesFence);
-  if ([...factSets,...takeSets].some(set=>set.warnings.length)) throw new OperationError('invalid_params','A canonical facts or takes fence cannot be parsed losslessly.');
-  const facts=factSets.flatMap(set=>set.facts),takes=takeSets.flatMap(set=>set.takes);
-  for(const rows of [facts,takes]) if(new Set(rows.map(row=>row.rowNum)).size!==rows.length) {
+}
+
+function assertUniqueRows(rows: Array<{ rowNum: number }>): void {
+  if(new Set(rows.map(row=>row.rowNum)).size!==rows.length) {
     throw new OperationError('invalid_params','Canonical row numbers must be unique across the entire page.');
   }
-  const body=fields.join('\n');
-  const factRows=extractFactsFromFenceText(facts,slug,sourceId);
-  const safe=sanitizeRemoteBody(body);
-  const timeline=new Map(extractTimelineFromContent(safe,slug).map(t=>[JSON.stringify([t.date,t.source,t.summary]),t]));
-  for (const t of parseTimelineEntries(safe)) timeline.set(JSON.stringify([t.date,t.source??'markdown',t.summary]),{...t,source:t.source??'markdown',slug});
-  return async tx=>{
-    const snapshot=await tx.readPageSnapshot(slug,{sourceId});
-    if (!snapshot) return;
+}
+
+/** Page-scoped `## Facts` projection shared by full canonical publication and managed fact maintenance. */
+export interface CanonicalFactsProjection {
+  rows: FenceExtractedFact[];
+  apply(tx: BrainEngine): Promise<{ inserted: number; expired: number }>;
+}
+
+/**
+ * Compile the facts half of a canonical projection. Rows are keyed by page row
+ * number: an indexed row whose (row_num, claim, visibility) is no longer in the
+ * fence is expired and detached (never deleted), then the fence rows are
+ * inserted/updated. `pageEffectiveDate` is the optional valid_from fallback the
+ * extract_facts reconcile has always threaded.
+ */
+export function prepareCanonicalFactsProjection(fields: string[], slug: string, sourceId: string,
+  opts: { pageEffectiveDate?: Date | null } = {}): CanonicalFactsProjection {
+  assertSingleFences(fields);
+  const factSets=fields.map(parseFactsFence);
+  if (factSets.some(set=>set.warnings.length)) throw new OperationError('invalid_params','A canonical facts or takes fence cannot be parsed losslessly.');
+  const facts=factSets.flatMap(set=>set.facts);
+  assertUniqueRows(facts);
+  const rows=extractFactsFromFenceText(facts,slug,sourceId,{ pageEffectiveDate: opts.pageEffectiveDate });
+  return { rows, apply: async tx=>{
     // Fact IDs in permanent receipts remain meaningful when a canonical row is
     // removed/replaced. Expire and detach its row position instead of deleting it.
-    const incoming=JSON.stringify(factRows.map(f=>({row_num:f.row_num,fact:f.fact,visibility:f.visibility})));
-    await tx.executeRaw(`UPDATE facts f SET expired_at=COALESCE(expired_at,now()),row_num=NULL
+    const incoming=JSON.stringify(rows.map(f=>({row_num:f.row_num,fact:f.fact,visibility:f.visibility})));
+    const expired=await tx.executeRaw<{ id: number }>(`UPDATE facts f SET expired_at=COALESCE(expired_at,now()),row_num=NULL
       WHERE source_id=$1 AND source_markdown_slug=$2 AND row_num IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM jsonb_to_recordset($3::text::jsonb) AS n(row_num integer,fact text,visibility text)
-        WHERE n.row_num=f.row_num AND n.fact=f.fact AND n.visibility=f.visibility)`,[sourceId,slug,incoming]);
-    if (factRows.length) {
-      await tx.insertFacts(factRows,{source_id:sourceId}); // gbrain-allow-direct-insert: canonical fence projection shares the journal publication transaction
-      for (const fact of factRows) await tx.executeRaw(`UPDATE facts SET kind=$4,notability=$5,context=$6,
+        WHERE n.row_num=f.row_num AND n.fact=f.fact AND n.visibility=f.visibility) RETURNING f.id`,[sourceId,slug,incoming]);
+    let inserted=0;
+    if (rows.length) {
+      inserted=(await tx.insertFacts(rows,{source_id:sourceId})).inserted; // gbrain-allow-direct-insert: canonical fence projection shares the journal publication transaction
+      for (const fact of rows) await tx.executeRaw(`UPDATE facts SET kind=$4,notability=$5,context=$6,
         valid_from=COALESCE($7::timestamptz,valid_from),valid_until=$8::timestamptz,expired_at=$9::timestamptz,
         source=$10,confidence=$11,claim_metric=$12,claim_value=$13,claim_unit=$14,claim_period=$15
         WHERE source_id=$1 AND source_markdown_slug=$2 AND row_num=$3`,
@@ -46,6 +61,27 @@ export function prepareCanonicalProjections(page: ParsedPage, slug: string, sour
         fact.valid_until?.toISOString()??null,fact.expired_at?.toISOString()??null,fact.source,fact.confidence,
         fact.claim_metric??null,fact.claim_value??null,fact.claim_unit??null,fact.claim_period??null]);
     }
+    return { inserted, expired: expired.length };
+  } };
+}
+
+/** Compile synchronous, provider-free projections before entering publication. */
+export function prepareCanonicalProjections(page: ParsedPage, slug: string, sourceId: string): (tx: BrainEngine) => Promise<void> {
+  const fields=[page.compiled_truth,page.timeline ?? ''];
+  assertSingleFences(fields);
+  const takeSets=fields.map(parseTakesFence);
+  const factsProjection=prepareCanonicalFactsProjection(fields,slug,sourceId);
+  if (takeSets.some(set=>set.warnings.length)) throw new OperationError('invalid_params','A canonical facts or takes fence cannot be parsed losslessly.');
+  const takes=takeSets.flatMap(set=>set.takes);
+  assertUniqueRows(takes);
+  const body=fields.join('\n');
+  const safe=sanitizeRemoteBody(body);
+  const timeline=new Map(extractTimelineFromContent(safe,slug).map(t=>[JSON.stringify([t.date,t.source,t.summary]),t]));
+  for (const t of parseTimelineEntries(safe)) timeline.set(JSON.stringify([t.date,t.source??'markdown',t.summary]),{...t,source:t.source??'markdown',slug});
+  return async tx=>{
+    const snapshot=await tx.readPageSnapshot(slug,{sourceId});
+    if (!snapshot) return;
+    await factsProjection.apply(tx);
     const pageId=snapshot.page.id;
     await tx.executeRaw('DELETE FROM takes WHERE page_id=$1 AND NOT(row_num=ANY($2::integer[]))',[pageId,takes.map(t=>t.rowNum)]);
     if (takes.length) await tx.addTakesBatch(takes.map(t=>takesPreparation.toBatchInput(pageId,t,

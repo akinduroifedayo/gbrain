@@ -55,7 +55,10 @@ test('unsupported bulk conversation extraction refuses before either preview or 
     })).rejects.toMatchObject({ code: 'writer_coordinator_required' });
   }
   expect(extractions).toBe(0);
-  await expect(runExtractFacts(engine, { sourceId: 'default' })).rejects.toMatchObject({ code: 'writer_coordinator_required' });
+  // The cycle fence reconciler is supported on managed brains through the
+  // coordinator; with nothing drifted it admits no work and writes no facts.
+  const reconcile = await runExtractFacts(engine, { sourceId: 'default' });
+  expect(reconcile.managed).toMatchObject({ pagesReconciled: 0 });
   expect(await engine.executeRaw('SELECT id FROM facts')).toHaveLength(0);
 }));
 
@@ -74,7 +77,7 @@ test('writer status and activation preview name unsupported bulk capabilities wi
   const before = await engine.executeRaw('SELECT * FROM persistence_brain');
   const status = await runPersistenceAdministration(engine, 'writer_status', {}) as any;
   const activation = await runPersistenceAdministration(engine, 'writer_activate', { confirm_quiesced: true, dry_run: true });
-  expect(status.onboarding.unsupported_maintenance).toEqual(['cycle.extract_facts', 'extract-conversation-facts', 'conversation_facts_backfill', 'loops_extract']);
+  expect(status.onboarding.unsupported_maintenance).toEqual(['extract-conversation-facts', 'conversation_facts_backfill', 'loops_extract']);
   expect(activation.unsupported_maintenance).toEqual(status.onboarding.unsupported_maintenance);
   expect(await engine.executeRaw('SELECT * FROM persistence_brain')).toEqual(before);
 }));

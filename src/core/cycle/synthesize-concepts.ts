@@ -21,6 +21,7 @@
 //   6. Write concept-typed pages with the synthesis mode made explicit.
 
 import type { BrainEngine, LinkBatchInput } from '../engine.ts';
+import type { Page } from '../types.ts';
 import { resolveModel } from '../model-config.ts';
 import type { PhaseResult } from '../cycle.ts';
 import type { ProgressReporter } from '../progress.ts';
@@ -34,6 +35,8 @@ import { createGlobalLlmHaltTracker, haltedClassOf, type GlobalLlmErrorClass } f
 // source-boost's 1.3× 'concepts/' weighting can actually reach them.
 import { importFromContent } from '../import-file.ts';
 import { serializeMarkdown } from '../markdown.ts';
+import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, replaceOrInsertFactsFence } from '../facts-fence.ts';
+import { TAKES_FENCE_BEGIN, TAKES_FENCE_END } from '../takes-fence.ts';
 import { maintenancePreflight, publishMaintenancePage, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
 import { isDbOnly, loadStorageConfig } from '../storage-config.ts';
 import { canonicalLookup, type ModelPricing } from '../model-pricing.ts';
@@ -366,22 +369,32 @@ export async function runPhaseSynthesizeConcepts(
       // #2163: serialize to markdown and import via the canonical pipeline so
       // the page is chunked (+ embedded when a provider is configured) —
       // mirrors put_page's isAvailable('embedding') → noEmbed gate.
+      const synthesizedFrontmatter = {
+        tier: group.tier,
+        mention_count: group.atomTitles.length,
+        composite_score: group.atomTitles.length,
+        synthesis_mode: synthesisMode,
+        synthesized_at: new Date().toISOString(),
+        synthesized_by: 'synthesize_concepts-v0.41',
+      };
       const md = serializeMarkdown(
-        {
-          tier: group.tier,
-          mention_count: group.atomTitles.length,
-          composite_score: group.atomTitles.length,
-          synthesis_mode: synthesisMode,
-          synthesized_at: new Date().toISOString(),
-          synthesized_by: 'synthesize_concepts-v0.41',
-        },
+        synthesizedFrontmatter,
         narrative,
         '',
         { type: 'concept', title: title.replace(/-/g, ' '), tags: [] },
       );
       const conceptSlug = `concepts/${title}`;
       if (maintenance) {
-        await publishManagedConcept(engine, maintenance, conceptSlug, md, opts.brainDir);
+        try {
+          await publishManagedConcept(engine, maintenance, conceptSlug, synthesizedFrontmatter, narrative, opts.brainDir);
+        } catch (err) {
+          // One concept whose canonical file carries an uncoordinated edit
+          // (or changed mid-run) must not stop the phase: record it and move on.
+          const code = (err as { code?: string }).code;
+          if (code !== 'source_changed' && code !== 'revision_conflict') throw err;
+          failures.push({ concept: group.conceptSlug, error: `publication refused (${code}): ${(err as Error).message}` });
+          continue;
+        }
       } else {
         await importFromContent(engine, conceptSlug, md, {
           noEmbed: !isAvailable('embedding'),
@@ -504,7 +517,7 @@ export async function runPhaseSynthesizeConcepts(
  * DERIVE_PHASE_DB_ONLY_DEFAULTS). A declared `db_only` tier always wins.
  */
 async function publishManagedConcept(engine: BrainEngine, authority: MaintenanceAuthority,
-  slug: string, markdown: string, brainDir?: string): Promise<void> {
+  slug: string, synthesized: Record<string, unknown>, narrative: string, brainDir?: string): Promise<void> {
   const snapshot = await engine.readPageSnapshot(slug, { sourceId: authority.writer.sourceId, includeDeleted: true });
   let dbOnly = !snapshot?.page.source_path;
   if (!dbOnly) {
@@ -515,8 +528,40 @@ async function publishManagedConcept(engine: BrainEngine, authority: Maintenance
       // Unreadable gbrain.yml: keep the recorded file; sync reports the config.
     }
   }
+  const title = slug.split('/').pop()!.replace(/-/g, ' ');
+  const markdown = snapshot && !snapshot.page.deleted_at
+    ? composeConceptRepublication(snapshot.page, snapshot.tags, synthesized, narrative)
+    : serializeMarkdown(synthesized, narrative, '', { type: 'concept', title, tags: [] });
   await publishMaintenancePage(engine, authority, slug, markdown,
     { expectedRevision: snapshot?.revision ?? null, file: !dbOnly });
+}
+
+/**
+ * The synthesized narrative is the only part of a concept page this phase
+ * owns. Republishing an existing concept keeps everything else the page
+ * already carries — its `## Facts` / `## Takes` fences (the system of record
+ * for those rows; dropping them would expire every fact and delete every
+ * take on publication), its timeline, its tags, and any frontmatter keys the
+ * synthesis does not set. Pure: exported for tests.
+ */
+export function composeConceptRepublication(page: Pick<Page, 'type' | 'title' | 'compiled_truth' | 'timeline' | 'frontmatter'>,
+  tags: string[], synthesized: Record<string, unknown>, narrative: string): string {
+  const body = page.compiled_truth ?? '';
+  let compiled = narrative.trim();
+  const facts = fenceBlock(body, FACTS_FENCE_BEGIN, FACTS_FENCE_END);
+  if (facts) compiled = replaceOrInsertFactsFence(compiled, facts).trimEnd();
+  const takes = fenceBlock(body, TAKES_FENCE_BEGIN, TAKES_FENCE_END);
+  if (takes) compiled = `${compiled}\n\n## Takes\n\n${takes}`;
+  const { type: _type, title: _title, tags: _tags, ...kept } = (page.frontmatter ?? {}) as Record<string, unknown>;
+  return serializeMarkdown({ ...kept, ...synthesized }, compiled, (page.timeline ?? '').trim(),
+    { type: page.type ?? 'concept', title: page.title, tags });
+}
+
+function fenceBlock(body: string, begin: string, end: string): string | null {
+  const start = body.indexOf(begin);
+  if (start === -1) return null;
+  const stop = body.indexOf(end, start + begin.length);
+  return stop === -1 ? null : body.slice(start, stop + end.length);
 }
 
 /**

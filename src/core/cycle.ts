@@ -1533,6 +1533,7 @@ async function runPhaseExtractFacts(
         phantoms_skipped_drift: result.phantomsSkippedDrift,
         phantoms_lock_busy: result.phantomsLockBusy,
         phantoms_more_pending: result.phantomsMorePending,
+        ...(result.managed ? { managed: result.managed } : {}),
       },
     };
   } catch (e) {

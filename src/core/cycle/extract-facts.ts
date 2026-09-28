@@ -76,6 +76,8 @@ import { isAborted } from '../abort-check.ts';
 import { parseMarkdown } from '../markdown.ts';
 import { isWriteThroughDisabled, resolvePageWriteTarget } from '../write-through.ts';
 import { acquirePageLock } from '../page-lock.ts';
+import { managedPersistenceEnabled } from '../persistence/ownership.ts';
+import { runManagedExtractFacts } from './extract-facts-managed.ts';
 
 interface ExistingPageFact {
   // v0.46 (#3014) — the row's own fact id. Read so the supersession-drift
@@ -279,6 +281,8 @@ export interface ExtractFactsResult {
   phantomsSkippedDrift: number;
   phantomsLockBusy: boolean;
   phantomsMorePending: boolean;
+  /** Managed-brain coordinator reconcile counts (absent on the legacy path). */
+  managed?: { pagesInSync: number; pagesReconciled: number; pagesPreserved: number; pagesFenceAbsent: number };
 }
 
 /**
@@ -359,8 +363,9 @@ export async function runExtractFacts(
   engine: BrainEngine,
   opts: ExtractFactsOpts = {},
 ): Promise<ExtractFactsResult> {
-  await assertUnmanagedCanonicalWriter(engine, 'legacy fact-fence reconciliation');
   const sourceId = opts.sourceId ?? 'default';
+  if (await managedPersistenceEnabled(engine)) return runManagedFactsPhase(engine, sourceId, opts);
+  await assertUnmanagedCanonicalWriter(engine, 'legacy fact-fence reconciliation');
   const result: ExtractFactsResult = {
     pagesScanned: 0,
     pagesWithFacts: 0,
@@ -918,4 +923,39 @@ export async function runExtractFacts(
   }
 
   return result;
+}
+
+/**
+ * Managed brains: fence → index reconcile through the persistence coordinator
+ * (extract-facts-managed.ts). The phantom-redirect pre-pass rewrites and
+ * unlinks canonical files outside coordination, so it does not run here; the
+ * phantom counters stay zero and the pending work is named in a warning only
+ * when unprefixed pages exist.
+ */
+async function runManagedFactsPhase(engine: BrainEngine, sourceId: string, opts: ExtractFactsOpts): Promise<ExtractFactsResult> {
+  const managed = await runManagedExtractFacts(engine, { sourceId, slugs: opts.slugs, dryRun: opts.dryRun,
+    brainDir: opts.brainDir, signal: opts.signal });
+  const warnings = [...managed.warnings];
+  if (opts.brainDir) {
+    const [phantoms] = await engine.executeRaw<{ n: number | string }>(
+      "SELECT count(*) AS n FROM pages WHERE source_id=$1 AND deleted_at IS NULL AND slug NOT LIKE '%/%'", [sourceId]);
+    if (Number(phantoms?.n ?? 0) > 0) {
+      warnings.push(`extract_facts: phantom redirect is not available on a managed brain; ${Number(phantoms!.n)} unprefixed page(s) not examined`);
+    }
+  }
+  if (managed.factsMissingEmbedding > 0) {
+    warnings.push(`extract_facts: ${managed.factsMissingEmbedding} active fence fact(s) have no embedding; run \`gbrain embed --facts\``);
+  }
+  if (!opts.dryRun) {
+    await upsertExtractRollup(engine, { kind: 'facts.fence', source_id: sourceId, cost_delta: 0, round_completed_delta: 1, halt_delta: 0 });
+  }
+  return {
+    pagesScanned: managed.pagesScanned, pagesWithFacts: managed.pagesWithFacts,
+    factsInserted: managed.factsInserted, factsDeleted: managed.factsExpired,
+    legacyRowsPending: 0, guardTriggered: false, warnings,
+    phantomsScanned: 0, phantomsRedirected: 0, phantomsAmbiguous: 0, phantomsSkippedDrift: 0,
+    phantomsLockBusy: false, phantomsMorePending: false,
+    managed: { pagesInSync: managed.pagesInSync, pagesReconciled: managed.pagesReconciled,
+      pagesPreserved: managed.pagesPreserved, pagesFenceAbsent: managed.pagesFenceAbsent },
+  };
 }

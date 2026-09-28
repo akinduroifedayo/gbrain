@@ -542,13 +542,22 @@ consolidation uses a single source-scoped take/fact transaction. A retired or
 resolved matching take is skipped, not silently reopened. Only world-visible
 facts backed by live non-private evidence are eligible for public consolidation;
 this is no guarantee that private facts will be consolidated. Remote maintenance
-authority is not added. Legacy fence reconciliation (`dream --phase
-extract_facts`), bulk `extract-conversation-facts`,
-`conversation_facts_backfill`, and `loops_extract` remain unsupported under
-managed persistence, including preview paths that could spend. Their preflight
-refuses with `writer_coordinator_required`; writer status and activation preview
-list them in `unsupported_maintenance`. The restored `extract_facts` operation
-and page backstop are separate from the legacy cycle fence reconciler. Do not
+authority is not added. The cycle fence reconciler (`dream --phase extract_facts`) runs on managed
+brains as a coordinator lane: each page whose indexed fence rows drifted from
+its `## Facts` fence is re-projected by one DB-only `managed_maintenance_facts`
+request pinned to the compared page revision, reusing the canonical facts
+projection (replaced rows are expired and detached, never deleted). In-sync
+pages are not admitted. Pages with an unparseable, duplicated or below-sentinel
+fence, a stale pages cache, or conversation facts sharing the row keyspace are
+preserved with a warning, and a missing fence is never read as a withdrawal. The
+phase calls no embedding provider (NULL vectors are reported for `gbrain embed
+--facts`), and the phantom-redirect file rewrite does not run under managed
+persistence. Bulk `extract-conversation-facts`, `conversation_facts_backfill`,
+and `loops_extract` remain unsupported, including preview paths that could
+spend. Their preflight refuses with `writer_coordinator_required`; writer status
+and activation preview list them in `unsupported_maintenance`. The restored
+`extract_facts` operation and page backstop are separate from the cycle fence
+reconciler. Do not
 infer that every dream or job writer is restored from the named lanes above.
 
 Google and GitHub API sources route through managed connector checkpoints,

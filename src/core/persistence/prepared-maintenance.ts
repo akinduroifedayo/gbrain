@@ -12,6 +12,7 @@ import { admitWrite, assertReplayIntent, getWriteRequest, intentDigest } from '.
 import { assertPersistenceAccepting, waitForWrite, writeResponse } from './service.ts';
 import { preparePageMutation, prepareFileTarget } from './page-prepare.ts';
 import { prepareTakesMutation } from './takes-prepare.ts';
+import { prepareCanonicalFactsProjection } from './canonical-projections.ts';
 import { digest } from './digest.ts';
 import type { PreparedMutation } from './coordinator.ts';
 import type { WriteAuthority, WriteRequest } from './model.ts';
@@ -127,6 +128,38 @@ export async function verifyMaintenanceOutputs(engine: BrainEngine, authority: M
   return authority.binding ? refs.length : 0;
 }
 
+/**
+ * Managed extract_facts: re-project one page's `## Facts` fence into the facts
+ * index. DB-only (the canonical file is not touched) and pinned to the observed
+ * page revision. The fence is re-read from the page at preparation time; the
+ * caller supplies only the slug and revision, never fact content.
+ */
+export async function submitMaintenanceFactsReconcile(engine: BrainEngine, authority: MaintenanceAuthority,
+  slug: string, expectedRevision: string): Promise<Record<string, unknown>> {
+  const intent = { kind: 'managed_maintenance_facts', expected_revision: expectedRevision };
+  const requestId = maintenanceRequestId({ source: authority.writer.sourceIncarnation, slug, intent });
+  return submitMaintenance(engine, authority, slug, intent, requestId, false);
+}
+
+async function prepareFactsReconcile(engine: BrainEngine, row: WriteRequest): Promise<PreparedMutation> {
+  const expected = String(row.intent?.expected_revision ?? "");
+  const snapshot = await engine.readPageSnapshot(row.slug, { sourceId: row.source_id });
+  if (!snapshot || snapshot.revision !== expected) throw new OperationError('revision_conflict', 'The fact-fence page changed before preparation.');
+  const projection = prepareCanonicalFactsProjection([snapshot.page.compiled_truth, snapshot.page.timeline ?? ''],
+    row.slug, row.source_id, { pageEffectiveDate: snapshot.page.effective_date ?? null });
+  return { observedRevision: expected, deferEmbedding: true,
+    validate: async tx => {
+      const current = await tx.readPageSnapshot(row.slug, { sourceId: row.source_id });
+      if (!current || current.page.id !== snapshot.page.id || current.revision !== expected) {
+        throw new OperationError('revision_conflict', 'The fact-fence page changed during preparation.');
+      }
+    },
+    apply: async tx => {
+      const { inserted, expired } = await projection.apply(tx);
+      return { noop: false, facts_projected: projection.rows.length, facts_inserted: inserted, facts_expired: expired };
+    } };
+}
+
 interface FactSnapshot { id: number; value: Record<string, unknown>; }
 interface EvidencePage { slug: string; revision: string; id: number; }
 
@@ -189,6 +222,7 @@ export async function prepareMaintenanceMutation(engine: BrainEngine, row: Write
       return { ...outcome, event_projected: projected };
     } };
   }
+  if (row.intent?.kind === 'managed_maintenance_facts') return prepareFactsReconcile(engine, row);
   if (row.intent?.kind !== 'managed_maintenance_consolidate') throw new OperationError('invalid_params', 'Unsupported maintenance request.');
   const p = row.intent;
   const facts = p.facts as FactSnapshot[];

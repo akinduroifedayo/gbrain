@@ -51,6 +51,25 @@ async function captureGlobalHandler(engine: BrainEngine) {
   return handlers.get('autopilot-global-maintenance')!;
 }
 
+// A file-backed concept that also carries canonical fact/take fences and a
+// timeline. Synthesis owns only the narrative; republication must keep the rest.
+const OWNER_CONCEPT = [
+  '---', 'title: owner writes', 'type: concept', 'curated_by: operator', '---',
+  'Old narrative.', '',
+  '## Facts', '', '<!--- gbrain:facts:begin -->', '',
+  '| # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context |',
+  '|---|-------|------|------------|------------|------------|------------|-------------|--------|---------|',
+  '| 1 | Owner writes survive restarts | fact | 1.0 | world | high | 2026-09-01 |  | fence |  |',
+  '<!--- gbrain:facts:end -->', '',
+  '## Takes', '', '<!--- gbrain:takes:begin -->', '',
+  '| # | claim | kind | who | weight | since | source |',
+  '|---|-------|------|-----|--------|-------|--------|',
+  '| 1 | Owner writes are the right default | take | self | 0.8 | 2026-09-01 | fence |',
+  '<!--- gbrain:takes:end -->', '',
+  '<!-- timeline -->', '',
+  '- **2026-09-02** | test — Owner write path adopted', '',
+].join('\n');
+
 /** Fixture data is seeded before activation, exactly like a brain that predates managed mode. */
 async function seedLegacyCorpus(engine: BrainEngine, sourceId: string) {
   const ctx = { engine, sourceId, remote: false as const, config: { engine: engine.kind, embedding_disabled: true },
@@ -59,7 +78,7 @@ async function seedLegacyCorpus(engine: BrainEngine, sourceId: string) {
     slug: 'people/example', content: '---\ntitle: Example\ntype: person\n---\nExample person.', request_id: randomUUID() } });
   // A concept that already has a canonical file (older brains file-back concepts).
   await submitPageMutation(ctx, { operation: 'put_page', params: {
-    slug: 'concepts/owner-writes', content: '---\ntitle: owner writes\ntype: concept\n---\nOld narrative.', request_id: randomUUID() } });
+    slug: 'concepts/owner-writes', content: OWNER_CONCEPT, request_id: randomUUID() } });
   for (const [slug, concepts] of [
     ['atoms/durable-memory-one', ['durable-memory']],
     ['atoms/durable-memory-two', ['durable-memory', 'owner-writes']],
@@ -128,6 +147,20 @@ test('managed global maintenance lane completes every applicable phase and stamp
         const ownerFile = readFileSync(join(root, 'concepts/owner-writes.md'), 'utf8');
         expect(ownerFile).toContain('synthesize_concepts-v0.41');
         expect(ownerFile).not.toContain('Old narrative.');
+        // Republication replaces only the narrative: fences, timeline and
+        // unrelated frontmatter survive in the file and the index.
+        for (const kept of ['Owner writes survive restarts', 'Owner writes are the right default',
+          'Owner write path adopted', 'curated_by: operator']) expect(ownerFile).toContain(kept);
+        const owner = await engine.readPageSnapshot('concepts/owner-writes', { sourceId });
+        expect(owner?.page.compiled_truth).toContain('gbrain:facts:begin');
+        expect(owner?.page.compiled_truth).toContain('gbrain:takes:begin');
+        expect(owner?.page.timeline).toContain('Owner write path adopted');
+        const ownerFacts = await engine.executeRaw<{ fact: string; expired: boolean }>(
+          "SELECT fact,expired_at IS NOT NULL AS expired FROM facts WHERE source_id=$1 AND source_markdown_slug='concepts/owner-writes'", [sourceId]);
+        expect(ownerFacts.map(f => [f.fact, f.expired])).toEqual([['Owner writes survive restarts', false]]);
+        const ownerTakes = await engine.executeRaw<{ claim: string }>(
+          'SELECT t.claim FROM takes t JOIN pages p ON p.id=t.page_id WHERE p.source_id=$1 AND p.slug=$2', [sourceId, 'concepts/owner-writes']);
+        expect(ownerTakes.map(t => t.claim)).toEqual(['Owner writes are the right default']);
         const receipts = await engine.executeRaw<{ slug: string; state: string }>(
           "SELECT slug,state FROM persistence_requests WHERE source_id=$1 AND operation='submit_job' AND slug LIKE 'concepts/%' ORDER BY slug", [sourceId]);
         expect(receipts.map(r => [r.slug, r.state])).toEqual([['concepts/durable-memory', 'committed'], ['concepts/owner-writes', 'committed']]);
