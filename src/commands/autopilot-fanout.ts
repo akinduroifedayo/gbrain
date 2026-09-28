@@ -35,7 +35,7 @@
 import { existsSync } from 'fs';
 import type { BrainEngine, SourceRow } from '../core/engine.ts';
 import type { MinionQueue } from '../core/minions/queue.ts';
-import { SOURCE_FRESHNESS_PHASES, MAINTENANCE_PHASES, LAST_GLOBAL_AT_KEY } from '../core/cycle.ts';
+import { SOURCE_FRESHNESS_PHASES, MAINTENANCE_PHASES, LAST_GLOBAL_AT_KEY, LAST_GLOBAL_ATTEMPT_AT_KEY } from '../core/cycle.ts';
 import { sourceConfigHasRemoteUrl, sourceLocalPathSkipWarning } from '../core/sources-load.ts';
 import { isSyncDisabledConfig } from '../core/sync-policy.ts';
 import { AUTOPILOT_FULL_CYCLE_FLOOR_MINUTES } from './autopilot-remediation-policy.ts';
@@ -637,7 +637,7 @@ export async function dispatchGlobalMaintenance(
   engine: BrainEngine,
   queue: MinionQueue,
   opts: { repoPath: string; slot: string; timeoutMs: number; jsonMode: boolean; emit?: (l: string) => void; log?: (l: string) => void },
-): Promise<{ dispatched: boolean; coalesced?: boolean; reason: 'stale' | 'fresh' }> {
+): Promise<{ dispatched: boolean; coalesced?: boolean; reason: 'stale' | 'fresh' | 'backoff' }> {
   const emit = opts.emit ?? ((line) => process.stderr.write(line + '\n'));
   const log = opts.log ?? ((line) => console.log(line));
 
@@ -650,6 +650,10 @@ export async function dispatchGlobalMaintenance(
   const lastGlobalAt = await engine.getConfig(LAST_GLOBAL_AT_KEY);
   if (!isGlobalMaintenanceStale(lastGlobalAt, Date.now(), floorMin)) {
     return { dispatched: false, reason: 'fresh' };
+  }
+  const lastAttemptAt = await engine.getConfig(LAST_GLOBAL_ATTEMPT_AT_KEY);
+  if (!isGlobalMaintenanceStale(lastAttemptAt, Date.now(), floorMin)) {
+    return { dispatched: false, reason: 'backoff' };
   }
 
   const job = await queue.add(

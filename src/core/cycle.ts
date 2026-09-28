@@ -288,8 +288,7 @@ export function normalizeQueuedSourcePhases(
   };
 }
 
-/** Config key holding the ISO timestamp of the last successful global-maintenance run. */
-export const LAST_GLOBAL_AT_KEY = 'autopilot.last_global_at';
+export { LAST_GLOBAL_AT_KEY, LAST_GLOBAL_ATTEMPT_AT_KEY } from './cycle/phase-scope.ts';
 
 /**
  * Phases that mutate state (filesystem or DB) and therefore should

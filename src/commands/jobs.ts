@@ -2768,12 +2768,10 @@ export async function registerBuiltinHandlers(
     };
   });
 
-  // Brain-wide maintenance. Runs mixed + global phases ONCE per window instead
-  // of repeating cross-source transcript/reflection reads in every source.
-  // No source_id → uses the legacy global cycle lock; stamps autopilot.last_global_at
-  // on success so the dispatch gate backs off.
+  // Mixed/global phases run once under the global lock, not once per source.
+  // Completion and attempt/backoff clocks are separate: unfinished is not fresh.
   worker.register('autopilot-global-maintenance', async (job) => {
-    const { runCycle, MAINTENANCE_PHASES, LAST_GLOBAL_AT_KEY } = await import('../core/cycle.ts');
+    const { runCycle, MAINTENANCE_PHASES, LAST_GLOBAL_AT_KEY, LAST_GLOBAL_ATTEMPT_AT_KEY } = await import('../core/cycle.ts');
     const repoPath: string | null = typeof job.data.repoPath === 'string'
       ? job.data.repoPath
       : (await engine.getConfig('sync.repo_path')) ?? null;
@@ -2805,7 +2803,8 @@ export async function registerBuiltinHandlers(
 
     if ((report.status === 'ok' || report.status === 'clean' || report.status === 'partial')
       && !report.phases.some(phase => {
-        if (phase.status === 'fail' || (phase.phase === 'synthesize_concepts' && (phase.details.publication_deferred as unknown[] | undefined)?.length)) return true; // #5484: deferred concept work is not freshness
+        if (phase.status === 'fail' || (phase.phase === 'synthesize_concepts' &&
+          ['publication_deferred', 'publication_held'].some(key => (phase.details[key] as unknown[] | undefined)?.length))) return true;
         if (phase.phase !== 'synthesize' && phase.phase !== 'patterns') return false;
         if (phase.details.reason === 'insufficient_cycle_budget') return true;
         if (phase.phase === 'patterns') {
@@ -2825,6 +2824,7 @@ export async function registerBuiltinHandlers(
       }
     }
 
+    await engine.setConfig(LAST_GLOBAL_ATTEMPT_AT_KEY, new Date().toISOString());
     return {
       partial: report.status === 'partial' || report.status === 'failed',
       status: report.status,

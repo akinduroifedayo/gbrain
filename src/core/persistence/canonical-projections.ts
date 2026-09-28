@@ -54,13 +54,23 @@ export function prepareCanonicalFactsProjection(fields: string[], slug: string, 
     let inserted=0;
     if (rows.length) {
       inserted=(await tx.insertFacts(rows,{source_id:sourceId})).inserted; // gbrain-allow-direct-insert: canonical fence projection shares the journal publication transaction
-      for (const fact of rows) await tx.executeRaw(`UPDATE facts SET kind=$4,notability=$5,context=$6,
-        valid_from=COALESCE($7::timestamptz,valid_from),valid_until=$8::timestamptz,expired_at=$9::timestamptz,
+      // Withdrawals own their caps even when the canonical snapshot carries a
+      // date-only overlay. Generated expiry dates retain an earlier projection.
+      for (const fact of rows) await tx.executeRaw(`WITH withdrawal AS (
+        SELECT min(withdrawn_at) AS at FROM fact_withdrawals WHERE source_id=$1 AND visibility=$17
+          AND fact_hash=gbrain_fact_fingerprint($18)
+      ) UPDATE facts f SET kind=$4,notability=$5,context=$6,
+        valid_from=COALESCE($7::timestamptz,valid_from),
+        valid_until=CASE WHEN w.at IS NOT NULL THEN LEAST(COALESCE(valid_until,w.at),w.at)
+          WHEN $16 AND expired_at IS NOT NULL THEN COALESCE(valid_until,$8::timestamptz) ELSE $8::timestamptz END,
+        expired_at=CASE WHEN w.at IS NOT NULL THEN LEAST(COALESCE(expired_at,w.at),w.at)
+          WHEN $16 THEN COALESCE(expired_at,$9::timestamptz) ELSE $9::timestamptz END,
         source=$10,confidence=$11,claim_metric=$12,claim_value=$13,claim_unit=$14,claim_period=$15
-        WHERE source_id=$1 AND source_markdown_slug=$2 AND row_num=$3`,
+        FROM withdrawal w WHERE source_id=$1 AND source_markdown_slug=$2 AND row_num=$3`,
       [sourceId,slug,fact.row_num,fact.kind,fact.notability,fact.context,fact.valid_from?.toISOString()??null,
         fact.valid_until?.toISOString()??null,fact.expired_at?.toISOString()??null,fact.source,fact.confidence,
-        fact.claim_metric??null,fact.claim_value??null,fact.claim_unit??null,fact.claim_period??null]);
+        fact.claim_metric??null,fact.claim_value??null,fact.claim_unit??null,fact.claim_period??null,fact.valid_until_generated??false,
+        fact.visibility,fact.fact]);
     }
     // insertFacts resolves `superseded by #N` only for rows it inserts; an
     // existing row whose fence declares (or changes) its supersession would

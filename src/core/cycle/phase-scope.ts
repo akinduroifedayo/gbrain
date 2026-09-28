@@ -1,5 +1,9 @@
 import type { CyclePhase } from '../cycle.ts';
 
+/** Last successful global completion, separate from the attempt/backoff clock. */
+export const LAST_GLOBAL_AT_KEY = 'autopilot.last_global_at';
+export const LAST_GLOBAL_ATTEMPT_AT_KEY = 'autopilot.last_global_attempt_at';
+
 /**
  * Phase-scope taxonomy. `runCycle` enforces it for explicit non-default
  * sources: only source phases run there; mixed and global phases run once in

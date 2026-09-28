@@ -50,6 +50,8 @@ import type { ParsedFact } from '../facts-fence.ts';
 export type FenceExtractedFact = NewFact & {
   row_num: number;
   source_markdown_slug: string;
+  /** True only for a generated today-stamp, never an authored date or null. */
+  valid_until_generated?: boolean;
   /**
    * v0.46 (#3014) — page-local row reference parsed from `~~claim~~` +
    * `superseded by #N` (the `#N`). NOT a fact id: `facts.superseded_by`
@@ -237,6 +239,7 @@ export function extractFactsFromFenceText(
       context: f.context ?? null,
       valid_from: validFrom,
       valid_until: validUntil,
+      valid_until_generated: !explicitUntil && !f.active && (f.forgotten || f.supersededBy === undefined),
       expired_at: expiredAt,
       source: f.source ?? FENCE_SOURCE_DEFAULT,
       confidence: f.confidence,

@@ -1,4 +1,5 @@
 import { realpathSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import type { BrainEngine, FactRow } from '../engine.ts';
 import { loadConfig, type GBrainConfig } from '../config.ts';
@@ -8,7 +9,9 @@ import { serializePageToMarkdown } from '../markdown.ts';
 import { submissionAuthority, authorizeStoredRequest, authorizeWrite } from './authority.ts';
 import { currentVerifiedLocalWriter, localHostId, registerLocalWriter } from './identity.ts';
 import { getWorktreeBinding, managedPersistenceEnabled, type WorktreeBinding } from './ownership.ts';
-import { admitWrite, assertReplayIntent, getWriteRequest, intentDigest } from './journal.ts';
+import { admitWrite, admitWriteInTransaction, assertReplayIntent, getWriteRequest, intentDigest } from './journal.ts';
+import { retryWriteAdmission } from './admission-retry.ts';
+import { readFenceIndex, observedIndexDigest } from '../facts/fence-index.ts';
 import { assertPersistenceAccepting, waitForWrite, writeResponse } from './service.ts';
 import { preparePageMutation, prepareFileTarget } from './page-prepare.ts';
 import { prepareTakesMutation } from './takes-prepare.ts';
@@ -128,13 +131,15 @@ export async function verifyMaintenanceOutputs(engine: BrainEngine, authority: M
   return authority.binding ? refs.length : 0;
 }
 
-/** Attempts per (page revision, observed index state) before a reconcile is reported as exhausted. */
+/** Consecutive terminal failures before a five-minute cooldown, not a lifetime cap. */
 export const FACTS_RECONCILE_MAX_ATTEMPTS = 3;
+export const FACTS_RECONCILE_BACKOFF_MS = 5 * 60_000;
 
 export type FactsReconcileOutcome =
   | { kind: 'admitted'; receipt: Record<string, unknown> }
   | { kind: 'joined'; receipt: Record<string, unknown> }
-  | { kind: 'exhausted'; attempts: number };
+  | { kind: 'stale' }
+  | { kind: 'exhausted'; attempts: number; retryAfter: string };
 
 /**
  * Managed extract_facts: re-project one page's `## Facts` fence into the facts
@@ -143,36 +148,52 @@ export type FactsReconcileOutcome =
  * caller supplies only the slug, revision and a digest of the index rows it
  * observed drifting, never fact content.
  *
- * Request identity is (source incarnation, slug, revision, observed index
- * digest, attempt). A reconcile only changes the derived index, never the page
- * revision, so revision alone cannot tell a replay from a new repair need:
- *   - an identical request still in flight (another run admitted it) is joined
- *     and reported as such, never as this run's reconcile;
- *   - a terminal attempt (committed, failed, conflict, cancelled) whose drift
- *     is observed again means the index drifted back or the attempt failed:
- *     the next attempt is admitted as a new request;
- *   - after FACTS_RECONCILE_MAX_ATTEMPTS terminal attempts for the same state
- *     the page is reported exhausted instead of retried every cycle.
- * Concurrent runs derive the same request id per attempt, so the journal's
- * idempotent admission keeps each attempt single-flight.
+ * A short source-exclusive transaction revalidates the observation, selects a
+ * live request to join or admits a new episode. Admission ownership is returned
+ * from that transaction, never inferred from a pre-admission lookup. Successful
+ * repairs reset the failure streak; after three failures, allow one probe per
+ * cooldown until recovery. There is no in-call repair retry loop.
  */
 export async function submitMaintenanceFactsReconcile(engine: BrainEngine, authority: MaintenanceAuthority,
   slug: string, expectedRevision: string, observedIndex: string): Promise<FactsReconcileOutcome> {
   await validateMaintenance(engine, authority, slug);
   const config = loadConfig() ?? { engine: engine.kind };
-  for (let attempt = 0; attempt < FACTS_RECONCILE_MAX_ATTEMPTS; attempt++) {
-    const intent = { kind: 'managed_maintenance_facts', expected_revision: expectedRevision, observed_index: observedIndex, attempt };
-    const requestId = maintenanceRequestId({ source: authority.writer.sourceIncarnation, slug, intent });
-    const prior = await getWriteRequest(engine, authority.writer.principal, requestId);
-    if (prior) {
-      await authorizeStoredRequest(engine, prior);
-      assertReplayIntent(prior, intentDigest({ operation: 'submit_job', sourceId: authority.writer.sourceId, slug, callerIntent: intent }));
-      if (isTerminal(prior)) continue;
-      return { kind: 'joined', receipt: writeResponse(await waitForWrite(engine, prior, config)) };
+  const requestId = randomUUID();
+  const admission = await retryWriteAdmission(requestId, remaining => engine.transaction(async tx => {
+    await tx.executeRaw("SELECT set_config('synchronous_commit','on',true),set_config('lock_timeout',$1,true),set_config('statement_timeout',$2,true)",
+      [`${Math.min(100, remaining)}ms`, `${remaining}ms`]);
+    // Follow the persistence lock order: source before authority/counters/request.
+    // This also excludes canonical publishers and withdrawals during observation.
+    await tx.executeRaw('SELECT incarnation FROM sources WHERE id=$1 FOR UPDATE', [authority.writer.sourceId]);
+    await validateMaintenance(tx, authority, slug);
+    const snapshot = await tx.readPageSnapshot(slug, { sourceId: authority.writer.sourceId });
+    if (!snapshot || snapshot.revision !== expectedRevision) {
+      throw new OperationError('revision_conflict', 'The fact-fence page changed before admission.');
     }
-    return { kind: 'admitted', receipt: await submitMaintenance(engine, authority, slug, intent, requestId, false) };
-  }
-  return { kind: 'exhausted', attempts: FACTS_RECONCILE_MAX_ATTEMPTS };
+    if (observedIndexDigest(await readFenceIndex(tx, authority.writer.sourceId, [slug])) !== observedIndex) {
+      return { kind: 'stale' as const };
+    }
+    const prior = await tx.executeRaw<WriteRequest>(`SELECT * FROM persistence_requests
+      WHERE source_incarnation=$1::uuid AND slug=$2 AND intent->>'kind'='managed_maintenance_facts'
+        AND intent->>'expected_revision'=$3 AND intent->>'observed_index'=$4
+      ORDER BY sequence DESC LIMIT $5`, [authority.writer.sourceIncarnation, slug, expectedRevision, observedIndex, FACTS_RECONCILE_MAX_ATTEMPTS]);
+    const live = prior.find(row => !isTerminal(row));
+    if (live) {
+      await authorizeStoredRequest(tx, live);
+      return { kind: 'joined' as const, row: live };
+    }
+    if (prior.length === FACTS_RECONCILE_MAX_ATTEMPTS && prior.every(row => row.state !== 'committed')) {
+      const retryAt = new Date(prior[0].completed_at!).getTime() + FACTS_RECONCILE_BACKOFF_MS;
+      if (Date.now() < retryAt) return { kind: 'exhausted' as const, attempts: prior.length, retryAfter: new Date(retryAt).toISOString() };
+    }
+    const intent = { kind: 'managed_maintenance_facts', expected_revision: expectedRevision, observed_index: observedIndex };
+    const row = await admitWriteInTransaction(tx, { principal: authority.writer.principal, requestId, operation: 'submit_job',
+      sourceId: authority.writer.sourceId, sourceIncarnation: authority.writer.sourceIncarnation, slug,
+      pageId: snapshot.page.id, authority: authority.writer, callerIntent: intent, intent, worktreeId: null, topologyGeneration: null });
+    return { kind: 'admitted' as const, row };
+  }));
+  if (admission.kind === 'stale' || admission.kind === 'exhausted') return admission;
+  return { kind: admission.kind, receipt: writeResponse(await waitForWrite(engine, admission.row, config)) };
 }
 
 async function prepareFactsReconcile(engine: BrainEngine, row: WriteRequest): Promise<PreparedMutation> {
@@ -189,6 +210,11 @@ async function prepareFactsReconcile(engine: BrainEngine, row: WriteRequest): Pr
       }
     },
     apply: async tx => {
+      // A publication/withdrawal can win after admission. It owns the new state;
+      // a stale request must neither overwrite it nor count somebody else's work.
+      if (observedIndexDigest(await readFenceIndex(tx, row.source_id, [row.slug])) !== row.intent?.observed_index) {
+        return { noop: true, facts_projected: 0, facts_inserted: 0, facts_expired: 0 };
+      }
       const { inserted, expired } = await projection.apply(tx);
       return { noop: false, facts_projected: projection.rows.length, facts_inserted: inserted, facts_expired: expired };
     } };

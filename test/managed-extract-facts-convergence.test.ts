@@ -23,7 +23,11 @@ import { join } from 'node:path';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runExtractFacts } from '../src/core/cycle/extract-facts.ts';
-import { factsInSync, type IndexedFact } from '../src/core/cycle/extract-facts-managed.ts';
+import { factsInSync, observedIndexDigest, type IndexedFact } from '../src/core/cycle/extract-facts-managed.ts';
+import { maintenancePreflight, submitMaintenanceFactsReconcile } from '../src/core/persistence/prepared-maintenance.ts';
+import { submitForgetMutation } from '../src/core/persistence/memory-mutations.ts';
+import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { prepareCanonicalFactsProjection } from '../src/core/persistence/canonical-projections.ts';
 import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
@@ -126,10 +130,17 @@ test('re-drift after a committed reconcile, with no page edit, is repaired again
     expect((await facts(engine, sourceId, 'people/redrift')).map(f => [f.row_num, f.fact, f.expired])).toEqual([[1, 'Alpha holds', false], [2, 'Beta holds', false]]);
     expect(await receipts(engine, sourceId, 'people/redrift')).toEqual(['committed', 'committed']);
 
+    // Successful episodes do not consume a lifetime failure allowance.
+    for (let episode = 3; episode <= 5; episode++) {
+      await drop();
+      const repaired = await run();
+      expect(repaired.managed).toMatchObject({ pagesReconciled: 1 });
+      expect(repaired.factsInserted).toBe(1);
+    }
     const steady = await run();
     expect(steady.managed).toMatchObject({ pagesReconciled: 0, pagesInSync: 1 });
     expect(steady.factsInserted).toBe(0);
-    expect(await receipts(engine, sourceId, 'people/redrift')).toHaveLength(2);
+    expect(await receipts(engine, sourceId, 'people/redrift')).toHaveLength(5);
   });
 }, 180_000);
 
@@ -143,7 +154,9 @@ test('a terminally failed reconcile is retried once its cause is removed (F3)', 
       WHEN (NEW.source_markdown_slug = 'people/retry') EXECUTE FUNCTION gbrain_test_refuse_fact()`);
     let failed: unknown;
     try {
-      await run();
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try { await run(); } catch (error) { failed = error; }
+      }
     } catch (error) {
       failed = error;
     } finally {
@@ -152,15 +165,21 @@ test('a terminally failed reconcile is retried once its cause is removed (F3)', 
     }
     expect(failed).toBeDefined(); // the run reports the failure; it is not counted as a reconcile
     const states = await receipts(engine, sourceId, 'people/retry');
-    expect(states).toHaveLength(1);
+    expect(states).toHaveLength(3);
     expect(['failed', 'conflict', 'cancelled']).toContain(states[0]);
     expect((await facts(engine, sourceId, 'people/retry')).map(f => f.row_num)).toEqual([1]);
 
+    // A tight fourth retry must be held, but expiry of backoff allows recovery.
+    const held = await run();
+    expect(held.managed!.pagesReconciled).toBe(0);
+    expect(await receipts(engine, sourceId, 'people/retry')).toHaveLength(3);
+    await unmanaged(() => engine.executeRaw(`UPDATE persistence_requests SET completed_at=now()-interval '1 hour'
+      WHERE source_id=$1 AND intent->>'kind'='managed_maintenance_facts'`, [sourceId]));
     const retried = await run();
     expect(retried.managed).toMatchObject({ pagesReconciled: 1 });
     expect(retried.factsInserted).toBe(1);
     expect((await facts(engine, sourceId, 'people/retry')).map(f => [f.row_num, f.fact])).toEqual([[1, 'Alpha holds'], [2, 'Beta holds']]);
-    expect((await receipts(engine, sourceId, 'people/retry')).slice(1)).toEqual(['committed']);
+    expect((await receipts(engine, sourceId, 'people/retry')).slice(3)).toEqual(['committed']);
   });
 }, 180_000);
 
@@ -227,6 +246,183 @@ test('withdrawal, privacy and repeated claims follow the fence without resurrect
 
     const steady = await run();
     expect(steady.managed).toMatchObject({ pagesReconciled: 0, pagesInSync: 3 });
+  });
+}, 180_000);
+
+test('struck authored validity converges exactly, including null, with stable ids (R3)', async () => {
+  await brain({ 'people/struck': page('Struck', [
+    row(1, '~~Dated old~~', { until: '2026-09-01', context: 'superseded by #3' }),
+    row(2, '~~Undated old~~', { context: 'superseded by #3' }),
+    row(3, 'Current'),
+  ]) }, async ({ engine, sourceId, unmanaged, run }) => {
+    const ids = (await facts(engine, sourceId, 'people/struck')).map(f => f.id);
+    for (const wrong of ['2020-01-01', null]) {
+      await unmanaged(async () => {
+        await engine.executeRaw('UPDATE facts SET valid_until=$2::timestamptz WHERE id=$1', [ids[0], wrong]);
+        await engine.executeRaw("UPDATE facts SET valid_until='2020-01-01' WHERE id=$1", [ids[1]]);
+      });
+      expect((await run()).managed!.pagesReconciled).toBe(1);
+      const rows = await engine.executeRaw<{ id: number; until: string | null }>(`SELECT id,
+        to_char(valid_until AT TIME ZONE 'UTC','YYYY-MM-DD') AS until FROM facts
+        WHERE source_id=$1 AND source_markdown_slug='people/struck' ORDER BY row_num`, [sourceId]);
+      expect(rows.map(r => Number(r.id))).toEqual(ids);
+      expect(rows.map(r => r.until)).toEqual(['2026-09-01', null, null]);
+      expect((await run()).managed).toMatchObject({ pagesReconciled: 0, pagesInSync: 1 });
+    }
+  });
+}, 180_000);
+
+test('concurrent observed drift is admitted once; stale observers consume no requests (R2)', async () => {
+  await brain({ 'people/race': page('Race', [row(1, 'Only fact')]) }, async ({ engine, sourceId, root, unmanaged }) => {
+    await unmanaged(() => engine.executeRaw("DELETE FROM facts WHERE source_id=$1 AND source_markdown_slug='people/race'", [sourceId]));
+    const authority = (await maintenancePreflight(engine, sourceId, root))!;
+    const revision = (await engine.readPageSnapshot('people/race', { sourceId }))!.revision;
+    const submit = () => submitMaintenanceFactsReconcile(engine, authority, 'people/race', revision, observedIndexDigest([]));
+    const results = await Promise.all([submit(), submit()]);
+    expect(results.filter(r => r.kind === 'admitted')).toHaveLength(1);
+    expect(await receipts(engine, sourceId, 'people/race')).toEqual(['committed']);
+    // The stale digest must not consume another attempt after completion.
+    for (let i = 0; i < 4; i++) expect((await submit()).kind).not.toBe('admitted');
+    expect(await receipts(engine, sourceId, 'people/race')).toEqual(['committed']);
+  });
+}, 180_000);
+
+test('generated expiry and withdrawal caps survive repair of another row (R3)', async () => {
+  await brain({ 'people/expiry': page('Expiry', [
+    row(1, '~~Generated end~~', { context: 'forgotten: old' }),
+    row(2, 'Withdraw me', { until: '2030-01-01' }), row(3, 'Drift me'),
+  ]) }, async ({ engine, sourceId, unmanaged, run }) => {
+    const ids = (await facts(engine, sourceId, 'people/expiry')).map(f => f.id);
+    await unmanaged(async () => {
+      await engine.executeRaw("UPDATE facts SET valid_until='2020-01-01',expired_at='2020-01-01' WHERE id=$1", [ids[0]]);
+      await recordFactWithdrawal(engine, ids[1], sourceId);
+      await engine.executeRaw('UPDATE facts SET confidence=0.2 WHERE id=$1', [ids[2]]);
+    });
+    const dates = () => engine.executeRaw(`SELECT id,valid_until,expired_at FROM facts WHERE id=ANY($1::int[]) ORDER BY id`, [ids.slice(0, 2)]);
+    const before = await dates();
+    expect((await run()).managed!.pagesReconciled).toBe(1);
+    expect(await dates()).toEqual(before);
+    expect((await facts(engine, sourceId, 'people/expiry')).map(f => f.id)).toEqual(ids);
+    expect((await run()).managed).toMatchObject({ pagesReconciled: 0, pagesInSync: 1 });
+  });
+}, 180_000);
+
+test('two discovery readers count one actual repair, not the shared receipt (R2)', async () => {
+  await brain({ 'people/counters': page('Counters', [row(1, 'Lost')]) }, async ({ engine, sourceId, unmanaged, run }) => {
+    await unmanaged(() => engine.executeRaw('DELETE FROM facts WHERE source_id=$1', [sourceId]));
+    const original = engine.executeRaw;
+    let readers = 0;
+    let release!: () => void;
+    const bothRead = new Promise<void>(resolve => { release = resolve; });
+    engine.executeRaw = async function (this: BrainEngine, sql, params, opts) {
+      const result = await original.call(this, sql, params, opts);
+      // Gate only the discovery query, never transaction-scoped revalidation.
+      if (this === engine && sql.includes('f.source_markdown_slug AS slug')) {
+        if (++readers === 2) release();
+        await bothRead;
+      }
+      return result as never;
+    };
+    let results;
+    try { results = await Promise.all([run(), run()]); }
+    finally { release(); delete (engine as Partial<BrainEngine>).executeRaw; }
+    expect(readers).toBe(2);
+    expect(results.reduce((n, r) => n + r.managed!.pagesReconciled, 0)).toBe(1);
+    expect(results.reduce((n, r) => n + r.factsInserted, 0)).toBe(1);
+    expect(await receipts(engine, sourceId, 'people/counters')).toEqual(['committed']);
+  });
+}, 180_000);
+
+test('withdrawal winning after repair preparation keeps its ledger, ids and expiry (R2)', async () => {
+  await brain({ 'people/late-withdrawal': page('Late withdrawal', [row(1, 'Withdraw while preparing'), row(2, 'Missing')]) },
+    async ({ engine, sourceId, unmanaged, run }) => {
+      const [target] = await facts(engine, sourceId, 'people/late-withdrawal');
+      await unmanaged(() => engine.executeRaw('DELETE FROM facts WHERE source_id=$1 AND row_num=2', [sourceId]));
+      const original = engine.readPageSnapshot;
+      let reached!: () => void, release!: () => void;
+      const atPrepare = new Promise<void>(resolve => { reached = resolve; });
+      const resume = new Promise<void>(resolve => { release = resolve; });
+      let paused = false;
+      engine.readPageSnapshot = async function (this: BrainEngine, slug, opts) {
+        const snapshot = await original.call(this, slug, opts);
+        if (!paused && slug === 'people/late-withdrawal' && new Error().stack?.includes('prepareFactsReconcile')) {
+          paused = true; reached(); await resume;
+        }
+        return snapshot;
+      };
+      const repairing = run();
+      try {
+        await atPrepare;
+        await submitForgetMutation({ engine, sourceId, remote: false, config: { engine: engine.kind, embedding_disabled: true },
+          dryRun: false, logger: { info() {}, warn() {}, error() {} } }, 'forget', { id: String(target.id), request_id: randomUUID() });
+      } finally { release(); }
+      let result;
+      try { result = await repairing; } finally { delete (engine as Partial<BrainEngine>).readPageSnapshot; }
+      expect(paused).toBe(true);
+      expect(result.managed!.pagesReconciled).toBe(0);
+      expect((await facts(engine, sourceId, 'people/late-withdrawal'))[0]).toMatchObject({ id: target.id, expired: true });
+      expect(await engine.executeRaw('SELECT * FROM fact_withdrawals WHERE source_id=$1', [sourceId])).toHaveLength(1);
+      // A fresh observation repairs the missing row without resurrecting the withdrawal.
+      expect((await run()).managed!.pagesReconciled).toBe(1);
+      expect((await facts(engine, sourceId, 'people/late-withdrawal'))[0]).toMatchObject({ id: target.id, expired: true });
+    });
+}, 180_000);
+
+test('index repaired after admission is revalidated before publication and not counted (R2)', async () => {
+  await brain({ 'people/late-index': page('Late index', [row(1, 'Missing')]) }, async ({ engine, sourceId, unmanaged, run }) => {
+    await unmanaged(() => engine.executeRaw('DELETE FROM facts WHERE source_id=$1', [sourceId]));
+    const snapshot = (await engine.readPageSnapshot('people/late-index', { sourceId }))!;
+    const projection = prepareCanonicalFactsProjection([snapshot.page.compiled_truth], 'people/late-index', sourceId);
+    const original = engine.readPageSnapshot;
+    let reached!: () => void, release!: () => void;
+    const atPrepare = new Promise<void>(resolve => { reached = resolve; });
+    const resume = new Promise<void>(resolve => { release = resolve; });
+    let paused = false;
+    engine.readPageSnapshot = async function (this: BrainEngine, slug, opts) {
+      const current = await original.call(this, slug, opts);
+      if (!paused && slug === 'people/late-index' && new Error().stack?.includes('prepareFactsReconcile')) {
+        paused = true; reached(); await resume;
+      }
+      return current;
+    };
+    const repairing = run();
+    let repaired;
+    try {
+      await atPrepare;
+      // Simulate another guarded projection worker completing the same repair.
+      await engine.transaction(async tx => {
+        await tx.lockPageKeys([{ sourceId, slug: 'people/late-index' }]);
+        await withCoordinatedWrite(tx, [sourceId], () => projection.apply(tx));
+      });
+      repaired = await facts(engine, sourceId, 'people/late-index');
+    } finally { release(); }
+    let result;
+    try { result = await repairing; } finally { delete (engine as Partial<BrainEngine>).readPageSnapshot; }
+    expect(paused).toBe(true);
+    expect(result.managed!.pagesReconciled).toBe(0);
+    expect(result.factsInserted).toBe(0);
+    expect(await facts(engine, sourceId, 'people/late-index')).toEqual(repaired);
+    const [receipt] = await engine.executeRaw<{ outcome: Record<string, unknown> }>(`SELECT outcome FROM persistence_requests
+      WHERE source_id=$1 AND intent->>'kind'='managed_maintenance_facts'`, [sourceId]);
+    expect(receipt.outcome).toMatchObject({ noop: true, facts_inserted: 0, facts_expired: 0 });
+    expect((await run()).managed!.pagesInSync).toBe(1);
+  });
+}, 180_000);
+
+test('old maintenance authority cannot repair a replacement source with the same slug (R2)', async () => {
+  await brain({ 'people/recreated': page('Recreated', [row(1, 'Retained')]) }, async ({ engine, sourceId, root, unmanaged }) => {
+    const authority = (await maintenancePreflight(engine, sourceId, root))!;
+    const revision = (await engine.readPageSnapshot('people/recreated', { sourceId }))!.revision;
+    await unmanaged(async () => {
+      await engine.executeRaw('DELETE FROM sources WHERE id=$1', [sourceId]);
+      await engine.executeRaw('INSERT INTO sources(id,name) VALUES($1,$1)', [sourceId]);
+      await engine.executeRaw(`INSERT INTO pages(source_id,slug,type,title,compiled_truth,knowledge_revision)
+        VALUES($1,'people/recreated','person','Replacement','Untouched',$2::uuid)`, [sourceId, revision]);
+    });
+    await expect(submitMaintenanceFactsReconcile(engine, authority, 'people/recreated', revision, observedIndexDigest([])))
+      .rejects.toMatchObject({ code: 'source_changed' });
+    expect((await engine.readPageSnapshot('people/recreated', { sourceId }))!.page.compiled_truth).toBe('Untouched');
+    expect(await receipts(engine, sourceId, 'people/recreated')).toHaveLength(0);
   });
 }, 180_000);
 
