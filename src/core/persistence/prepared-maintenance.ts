@@ -15,7 +15,7 @@ import { prepareTakesMutation } from './takes-prepare.ts';
 import { prepareCanonicalFactsProjection } from './canonical-projections.ts';
 import { digest } from './digest.ts';
 import type { PreparedMutation } from './coordinator.ts';
-import type { WriteAuthority, WriteRequest } from './model.ts';
+import { isTerminal, type WriteAuthority, type WriteRequest } from './model.ts';
 import { authorizePageVisibility } from './page-visibility.ts';
 import { nativeLockCapability } from './native-lock.ts';
 import { assertPhysicalRoot } from './physical-root.ts';
@@ -128,17 +128,51 @@ export async function verifyMaintenanceOutputs(engine: BrainEngine, authority: M
   return authority.binding ? refs.length : 0;
 }
 
+/** Attempts per (page revision, observed index state) before a reconcile is reported as exhausted. */
+export const FACTS_RECONCILE_MAX_ATTEMPTS = 3;
+
+export type FactsReconcileOutcome =
+  | { kind: 'admitted'; receipt: Record<string, unknown> }
+  | { kind: 'joined'; receipt: Record<string, unknown> }
+  | { kind: 'exhausted'; attempts: number };
+
 /**
  * Managed extract_facts: re-project one page's `## Facts` fence into the facts
  * index. DB-only (the canonical file is not touched) and pinned to the observed
  * page revision. The fence is re-read from the page at preparation time; the
- * caller supplies only the slug and revision, never fact content.
+ * caller supplies only the slug, revision and a digest of the index rows it
+ * observed drifting, never fact content.
+ *
+ * Request identity is (source incarnation, slug, revision, observed index
+ * digest, attempt). A reconcile only changes the derived index, never the page
+ * revision, so revision alone cannot tell a replay from a new repair need:
+ *   - an identical request still in flight (another run admitted it) is joined
+ *     and reported as such, never as this run's reconcile;
+ *   - a terminal attempt (committed, failed, conflict, cancelled) whose drift
+ *     is observed again means the index drifted back or the attempt failed:
+ *     the next attempt is admitted as a new request;
+ *   - after FACTS_RECONCILE_MAX_ATTEMPTS terminal attempts for the same state
+ *     the page is reported exhausted instead of retried every cycle.
+ * Concurrent runs derive the same request id per attempt, so the journal's
+ * idempotent admission keeps each attempt single-flight.
  */
 export async function submitMaintenanceFactsReconcile(engine: BrainEngine, authority: MaintenanceAuthority,
-  slug: string, expectedRevision: string): Promise<Record<string, unknown>> {
-  const intent = { kind: 'managed_maintenance_facts', expected_revision: expectedRevision };
-  const requestId = maintenanceRequestId({ source: authority.writer.sourceIncarnation, slug, intent });
-  return submitMaintenance(engine, authority, slug, intent, requestId, false);
+  slug: string, expectedRevision: string, observedIndex: string): Promise<FactsReconcileOutcome> {
+  await validateMaintenance(engine, authority, slug);
+  const config = loadConfig() ?? { engine: engine.kind };
+  for (let attempt = 0; attempt < FACTS_RECONCILE_MAX_ATTEMPTS; attempt++) {
+    const intent = { kind: 'managed_maintenance_facts', expected_revision: expectedRevision, observed_index: observedIndex, attempt };
+    const requestId = maintenanceRequestId({ source: authority.writer.sourceIncarnation, slug, intent });
+    const prior = await getWriteRequest(engine, authority.writer.principal, requestId);
+    if (prior) {
+      await authorizeStoredRequest(engine, prior);
+      assertReplayIntent(prior, intentDigest({ operation: 'submit_job', sourceId: authority.writer.sourceId, slug, callerIntent: intent }));
+      if (isTerminal(prior)) continue;
+      return { kind: 'joined', receipt: writeResponse(await waitForWrite(engine, prior, config)) };
+    }
+    return { kind: 'admitted', receipt: await submitMaintenance(engine, authority, slug, intent, requestId, false) };
+  }
+  return { kind: 'exhausted', attempts: FACTS_RECONCILE_MAX_ATTEMPTS };
 }
 
 async function prepareFactsReconcile(engine: BrainEngine, row: WriteRequest): Promise<PreparedMutation> {

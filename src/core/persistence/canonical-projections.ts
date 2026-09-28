@@ -3,6 +3,7 @@ import type { ParsedPage } from '../import-file.ts';
 import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, parseFactsFence } from '../facts-fence.ts';
 import { TAKES_FENCE_BEGIN, TAKES_FENCE_END, parseTakesFence } from '../takes-fence.ts';
 import { extractFactsFromFenceText, type FenceExtractedFact } from '../facts/extract-from-fence.ts';
+import { isInt4RowRef, resolveSupersededByRow, type SupersedeTarget } from '../facts/supersede-resolve.ts';
 import { takesPreparation } from '../takes-write.ts';
 import { parseTimelineEntries } from '../link-extraction.ts';
 import { extractTimelineFromContent } from '../timeline-extract.ts';
@@ -60,6 +61,24 @@ export function prepareCanonicalFactsProjection(fields: string[], slug: string, 
       [sourceId,slug,fact.row_num,fact.kind,fact.notability,fact.context,fact.valid_from?.toISOString()??null,
         fact.valid_until?.toISOString()??null,fact.expired_at?.toISOString()??null,fact.source,fact.confidence,
         fact.claim_metric??null,fact.claim_value??null,fact.claim_unit??null,fact.claim_period??null]);
+    }
+    // insertFacts resolves `superseded by #N` only for rows it inserts; an
+    // existing row whose fence declares (or changes) its supersession would
+    // otherwise never converge. Resolve every declared reference against the
+    // page's current rows with the shared resolver (an unsafe reference
+    // resolves to NULL, never a guessed id). Rows without a reference are not
+    // touched: supersession recorded by other writers is preserved.
+    for (const fact of rows) {
+      if (fact.superseded_by_row === undefined) continue;
+      let target: SupersedeTarget | undefined;
+      if (isInt4RowRef(fact.superseded_by_row)) {
+        const [hit] = await tx.executeRaw<{ id: number | string; expired: boolean }>(`SELECT id,expired_at IS NOT NULL AS expired FROM facts
+          WHERE source_id=$1 AND source_markdown_slug=$2 AND row_num=$3 LIMIT 1`,[sourceId,slug,fact.superseded_by_row]);
+        target = hit ? { id: Number(hit.id), struck: hit.expired } : undefined;
+      }
+      const { superseded_by } = resolveSupersededByRow(fact.row_num, fact.superseded_by_row, target, slug);
+      await tx.executeRaw(`UPDATE facts SET superseded_by=$4 WHERE source_id=$1 AND source_markdown_slug=$2 AND row_num=$3
+        AND superseded_by IS DISTINCT FROM $4::bigint`,[sourceId,slug,fact.row_num,superseded_by]);
     }
     return { inserted, expired: expired.length };
   } };
