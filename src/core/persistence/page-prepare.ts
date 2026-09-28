@@ -61,6 +61,22 @@ function putProvenance(row: WriteRequest, snapshot: PageSnapshot | null, parsed:
   Object.assign(parsed.frontmatter, stamp);
   return stamp;
 }
+/**
+ * Whether canonical Markdown bytes represent exactly the page state of a read
+ * snapshot (the check coordinated publication applies before replacing a file).
+ * Withdrawal overlays intentionally precede physical mirroring. The ledger is
+ * applied by the import preparation and cannot be undone by this check.
+ * Maintenance writers use it to bind the bytes they derive a rewrite from to
+ * the revision they publish against.
+ */
+export async function canonicalFileMatchesSnapshot(engine: BrainEngine, markdown: string, slug: string, snapshot: PageSnapshot): Promise<boolean> {
+  const parsed = parseMarkdown(markdown, slug);
+  const expected = canonical(snapshot.page, snapshot.tags);
+  const actual = canonical({ ...parsed, ...await overlayCanonicalBodies(engine.executeRaw.bind(engine),
+    parsed.compiled_truth, parsed.timeline ?? '', snapshot.withdrawals) }, parsed.tags);
+  return digest(actual) === digest(expected);
+}
+
 export async function prepareFileTarget(engine: BrainEngine, row: Pick<WriteRequest, 'source_id' | 'worktree_id' | 'slug'>, snapshot: PageSnapshot | null,
   content: string | null, hostId?: string, options: { allowMissing?: boolean } = {}): Promise<PreparedMutation['file']> {
   if (!row.worktree_id) return undefined;
@@ -79,13 +95,7 @@ export async function prepareFileTarget(engine: BrainEngine, row: Pick<WriteRequ
   // A normal edit may replace only the bytes represented by its read snapshot.
   // Unknown local edits require explicit import/recovery, even for force writes.
   if (before && snapshot) {
-    const parsed = parseMarkdown(before.toString('utf8'), row.slug);
-    const expected = canonical(snapshot.page, snapshot.tags);
-    const actual = canonical({ ...parsed, ...await overlayCanonicalBodies(engine.executeRaw.bind(engine),
-      parsed.compiled_truth, parsed.timeline ?? '', snapshot.withdrawals) }, parsed.tags);
-    // Withdrawal overlays intentionally precede physical mirroring. The ledger
-    // is applied by the import preparation and cannot be undone by this check.
-    if (digest(actual) !== digest(expected)) {
+    if (!await canonicalFileMatchesSnapshot(engine, before.toString('utf8'), row.slug, snapshot)) {
       throw new OperationError('source_changed', 'The canonical file contains an uncoordinated local edit.', 'Import or recover the local edit before replacing this page.');
     }
   } else if (before && !snapshot && content !== null && sha256(before) !== sha256(content)) {

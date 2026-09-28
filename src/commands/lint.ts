@@ -33,6 +33,7 @@ import type { BrainEngine } from '../core/engine.ts';
 import { pathToSlug } from '../core/sync.ts';
 import { managedPersistenceEnabled } from '../core/persistence/ownership.ts';
 import { maintenancePreflight, publishMaintenancePage, type MaintenanceAuthority } from '../core/persistence/prepared-maintenance.ts';
+import { canonicalFileMatchesSnapshot } from '../core/persistence/page-prepare.ts';
 
 export interface LintIssue {
   file: string;
@@ -550,7 +551,7 @@ export interface LintResult {
  * coordinator never wrote), or the page changed between scan and admission.
  * Any other failure propagates and fails the run.
  */
-async function publishLintFix(engine: BrainEngine, authority: MaintenanceAuthority, root: string, page: string, fixed: string): Promise<LintIssue | null> {
+async function publishLintFix(engine: BrainEngine, authority: MaintenanceAuthority, root: string, page: string, scanned: string, fixed: string): Promise<LintIssue | null> {
   const relPath = relative(root, page);
   const slug = pathToSlug(relPath);
   const sourceId = authority.writer.sourceId;
@@ -559,11 +560,21 @@ async function publishLintFix(engine: BrainEngine, authority: MaintenanceAuthori
     return { file: relPath, line: 1, rule: 'managed-write-pending', fixable: false,
       message: `fix not applied: ${slug} is not an indexed page of source ${sourceId} (a managed brain only rewrites indexed pages)` };
   }
+  // The repair was derived from `scanned`. It may only be published against a
+  // revision whose canonical state is exactly those bytes; otherwise a write
+  // committed between the scan and this snapshot would be replaced by a
+  // repair of older content. The coordinator fences everything after the
+  // snapshot through the expected revision.
+  if (!await canonicalFileMatchesSnapshot(engine, scanned, slug, snapshot)) {
+    return { file: relPath, line: 1, rule: 'managed-write-pending', fixable: false,
+      message: `fix not applied: ${slug} changed while lint ran (scanned bytes are not its current revision); the next cycle retries` };
+  }
   try {
     await publishMaintenancePage(engine, authority, slug, fixed, { expectedRevision: snapshot.revision });
     return null;
   } catch (e) {
-    if ((e as { code?: unknown } | null)?.code === 'revision_conflict') {
+    const code = (e as { code?: unknown } | null)?.code;
+    if (code === 'revision_conflict' || code === 'source_changed') {
       return { file: relPath, line: 1, rule: 'managed-write-pending', fixable: false,
         message: `fix not applied: ${slug} changed while lint ran; the next cycle retries` };
     }
@@ -666,7 +677,7 @@ export async function runLintCore(opts: LintOpts): Promise<LintResult> {
         } else if (maintenance) {
           // #5180: managed brain — the coordinator rewrites the page (DB row
           // and worktree file together) or says why the repair must wait.
-          const pending = await publishLintFix(opts.engine!, maintenance, managedRoot, page, fixed);
+          const pending = await publishLintFix(opts.engine!, maintenance, managedRoot, page, content, fixed);
           if (pending) {
             issues.push(pending);
             totalIssues++;

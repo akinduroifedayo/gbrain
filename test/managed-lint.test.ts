@@ -181,3 +181,45 @@ test('unmanaged lint keeps the legacy filesystem write path', async () => {
     }
   }
 }, 30_000);
+
+test('managed lint never publishes a repair of older bytes over a newer coordinated revision (F1)', async () => {
+  await fixture(async (engine, sourceId, root) => {
+    await seed(engine, sourceId);
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+    const file = join(root, 'people/jane-doe.md');
+    const ctx = { engine, sourceId, remote: false as const, config: { engine: engine.kind, embedding_disabled: true },
+      dryRun: false, logger: { info() {}, warn() {}, error() {} } };
+    // Revision B commits after lint has read revision A's bytes and derived
+    // its repair, but before lint obtains the snapshot it publishes against.
+    const NEWER = `${PAGE}\nA newer coordinated line.\n`;
+    const original = engine.readPageSnapshot;
+    let raced = false;
+    engine.readPageSnapshot = async function (this: BrainEngine, slug, opts) {
+      if (!raced && slug === 'people/jane-doe') {
+        raced = true;
+        engine.readPageSnapshot = original;
+        const a = (await original.call(engine, slug, opts))!;
+        await submitPageMutation(ctx, { operation: 'put_page', params: { slug, content: NEWER,
+          expected_revision: a.revision, request_id: randomUUID() } });
+      }
+      return original.call(engine, slug, opts);
+    };
+    let first;
+    try {
+      first = await runLintCore({ target: root, fix: true, engine, sourceId });
+    } finally {
+      engine.readPageSnapshot = original;
+    }
+    expect(raced).toBe(true);
+    // Revision B survives in the index and the canonical file; the stale repair is pending.
+    expect(first).toMatchObject({ total_fixed: 0, fix_pending: 1, write_path: 'coordinator' });
+    expect((await engine.readPageSnapshot('people/jane-doe', { sourceId }))!.page.compiled_truth).toContain('A newer coordinated line.');
+    expect(readFileSync(file, 'utf8')).toContain('A newer coordinated line.');
+    // The next pass derives its repair from B and converges.
+    const second = await runLintCore({ target: root, fix: true, engine, sourceId });
+    expect(second).toMatchObject({ fix_pending: 0 });
+    const after = readFileSync(file, 'utf8');
+    expect(after).toContain('A newer coordinated line.');
+    expect(after).not.toContain('Of course');
+  });
+}, 60_000);
