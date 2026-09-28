@@ -31,6 +31,9 @@ import { prepareCanonicalFactsProjection } from '../src/core/persistence/canonic
 import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
+import { runPersistenceEffects } from '../src/core/persistence/effects.ts';
+import { localHostId } from '../src/core/persistence/identity.ts';
+import { waitFor } from './helpers/wait-for.ts';
 import { recordFactWithdrawal } from '../src/core/facts/withdrawal.ts';
 import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
@@ -362,9 +365,26 @@ test('withdrawal winning after repair preparation keeps its ledger, ids and expi
       expect(result.managed!.pagesReconciled).toBe(0);
       expect((await facts(engine, sourceId, 'people/late-withdrawal'))[0]).toMatchObject({ id: target.id, expired: true });
       expect(await engine.executeRaw('SELECT * FROM fact_withdrawals WHERE source_id=$1', [sourceId])).toHaveLength(1);
-      // A fresh observation repairs the missing row without resurrecting the withdrawal.
-      expect((await run()).managed!.pagesReconciled).toBe(1);
-      expect((await facts(engine, sourceId, 'people/late-withdrawal'))[0]).toMatchObject({ id: target.id, expired: true });
+      // Forget commits before its asynchronous file/cache mirror. A scan during
+      // that handoff may correctly preserve a stale cache, not count a repair.
+      await waitFor(async () => {
+        const mirrors = await engine.executeRaw<{ state: string }>(
+          "SELECT state FROM persistence_effects WHERE source_id=$1 AND kind='withdrawal-mirror'", [sourceId]);
+        return mirrors.length === 1 && mirrors[0].state === 'committed';
+      }, { label: 'withdrawal mirror committed' });
+      const ledger = await engine.executeRaw('SELECT * FROM fact_withdrawals WHERE source_id=$1', [sourceId]);
+      const caps = await engine.executeRaw('SELECT id,valid_until,expired_at FROM facts WHERE id=$1', [target.id]);
+      expect(await facts(engine, sourceId, 'people/late-withdrawal')).toHaveLength(1);
+      // Once the mirror is settled, a fresh observation must repair the missing row.
+      const fresh = await run();
+      expect(fresh.managed).toMatchObject({ pagesReconciled: 1, pagesPreserved: 0 });
+      expect(fresh.factsInserted).toBe(1);
+      expect((await facts(engine, sourceId, 'people/late-withdrawal')).map(f => [f.row_num, f.fact, f.expired])).toEqual([
+        [1, 'Withdraw while preparing', true], [2, 'Missing', false]]);
+      expect(await engine.executeRaw('SELECT id,valid_until,expired_at FROM facts WHERE id=$1', [target.id])).toEqual(caps);
+      expect(await engine.executeRaw('SELECT * FROM fact_withdrawals WHERE source_id=$1', [sourceId])).toEqual(ledger);
+      expect((await run()).managed).toMatchObject({ pagesReconciled: 0, pagesInSync: 1 });
+      expect(await receipts(engine, sourceId, 'people/late-withdrawal')).toEqual(['conflict', 'committed']);
     });
 }, 180_000);
 
@@ -424,6 +444,57 @@ test('old maintenance authority cannot repair a replacement source with the same
     expect((await engine.readPageSnapshot('people/recreated', { sourceId }))!.page.compiled_truth).toBe('Untouched');
     expect(await receipts(engine, sourceId, 'people/recreated')).toHaveLength(0);
   });
+}, 180_000);
+
+test('a withdrawal mirror overtaking discovery preserves the stale observation, then converges (qualification R4)', async () => {
+  const slug = 'people/mirror-race';
+  await brain({ [slug]: page('Mirror race', [row(1, 'Withdraw across scan'), row(2, 'Private missing', { visibility: 'private' })]) },
+    async ({ engine, sourceId, unmanaged, run }) => {
+      const [target] = await facts(engine, sourceId, slug);
+      // Stop the consumer so this test, not a timer, owns mirror scheduling.
+      await unmanaged(() => engine.executeRaw('DELETE FROM facts WHERE source_id=$1 AND row_num=2', [sourceId]));
+      const config = { engine: engine.kind, embedding_disabled: true };
+      await submitForgetMutation({ engine, sourceId, remote: false, config,
+        dryRun: false, logger: { info() {}, warn() {}, error() {} } }, 'forget', { id: String(target.id), request_id: randomUUID() });
+      // Retain prior fixture effects but keep them out of this explicitly driven schedule.
+      await engine.executeRaw("UPDATE persistence_effects SET next_attempt_at=now()+interval '1 hour' WHERE source_id<>$1", [sourceId]);
+      const ledger = await engine.executeRaw('SELECT * FROM fact_withdrawals WHERE source_id=$1', [sourceId]);
+      const caps = await engine.executeRaw('SELECT id,valid_until,expired_at FROM facts WHERE id=$1', [target.id]);
+      const original = engine.executeRaw;
+      let overtook = false;
+      engine.executeRaw = async function (this: BrainEngine, sql, params, opts) {
+        const result = await original.call(this, sql, params, opts);
+        if (this === engine && !overtook && sql.includes('SELECT p.slug,p.compiled_truth,p.timeline,p.effective_date')) {
+          overtook = true;
+          // Keep the actual old discovery result while the real mirror publishes
+          // its file and materializes the withdrawal overlay in the page cache.
+          await waitFor(async () => {
+            await runPersistenceEffects(engine, config, { hostId: localHostId(), limit: 1 });
+            const mirrors = await original.call(engine,
+              "SELECT state FROM persistence_effects WHERE source_id=$1 AND kind='withdrawal-mirror'", [sourceId]) as Array<{ state: string }>;
+            return mirrors.length === 1 && mirrors[0].state === 'committed';
+          }, { label: 'explicitly driven withdrawal mirror' });
+        }
+        return result as never;
+      };
+      let stale;
+      try { stale = await run(); } finally { delete (engine as Partial<BrainEngine>).executeRaw; }
+      expect(overtook).toBe(true);
+      expect(stale.warnings.some(w => w.includes('FACTS_PAGE_CACHE_STALE'))).toBe(true);
+      expect(stale.managed).toMatchObject({ pagesReconciled: 0, pagesPreserved: 1, pagesInSync: 0 });
+      expect(stale.factsInserted).toBe(0);
+      expect(await receipts(engine, sourceId, slug)).toEqual([]);
+      expect(await facts(engine, sourceId, slug)).toHaveLength(1);
+      const fresh = await run();
+      expect(fresh.managed).toMatchObject({ pagesReconciled: 1, pagesPreserved: 0 });
+      expect(fresh.factsInserted).toBe(1);
+      expect((await facts(engine, sourceId, slug)).map(f => [f.row_num, f.fact, f.visibility, f.expired])).toEqual([
+        [1, 'Withdraw across scan', 'world', true], [2, 'Private missing', 'private', false]]);
+      expect(await engine.executeRaw('SELECT id,valid_until,expired_at FROM facts WHERE id=$1', [target.id])).toEqual(caps);
+      expect(await engine.executeRaw('SELECT * FROM fact_withdrawals WHERE source_id=$1', [sourceId])).toEqual(ledger);
+      expect((await run()).managed).toMatchObject({ pagesReconciled: 0, pagesInSync: 1 });
+      expect(await receipts(engine, sourceId, slug)).toEqual(['committed']);
+    });
 }, 180_000);
 
 test('the in-sync predicate compares typed claims and tolerates REAL confidence rounding (F4)', () => {
