@@ -126,10 +126,10 @@ test('ambiguous concept originals are held byte-identical with their index; the 
     const files = new Map<string, Buffer>();
     for (const [name, { body, timeline }] of Object.entries(AMBIGUOUS)) {
       const file = join(root, `concepts/${name}.md`);
-      const bytes = Buffer.from(`---\ntitle: ${name}\ntype: concept\n---\n${body}\n\n<!-- gbrain:timeline -->\n${timeline}\n`);
+      const bytes = Buffer.from(`---\ntitle: ${name}\ntype: concept\n---\n${body}\n\n<!-- timeline -->\n${timeline}\n`);
       writeFileSync(file, bytes); files.set(file, bytes);
-      await engine.executeRaw(`INSERT INTO pages(source_id,slug,type,title,compiled_truth,timeline,frontmatter)
-        VALUES($1,$2,'concept',$3,$4,$5,'{}'::jsonb)`, [sourceId, `concepts/${name}`, name, body, timeline]);
+      await engine.executeRaw(`INSERT INTO pages(source_id,slug,type,title,compiled_truth,timeline,frontmatter,source_path)
+        VALUES($1,$2,'concept',$3,$4,$5,'{}'::jsonb,$6)`, [sourceId, `concepts/${name}`, name, body, timeline, `concepts/${name}.md`]);
       await engine.executeRaw(`INSERT INTO facts(source_id,entity_slug,fact,kind,visibility,notability,source,row_num,source_markdown_slug)
         VALUES($1,$2,$3,'fact','world','high','fence',1,$2),($1,$2,$4,'fact','world','high','fence',2,$2)`,
       [sourceId, `concepts/${name}`, `${name} indexed one`, `${name} indexed two`]);
