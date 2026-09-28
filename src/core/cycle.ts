@@ -1771,9 +1771,15 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
     } catch {
       // Non-fatal.
     }
+    // #5484: an operational failure purging a managed tombstone is a failed
+    // phase (never `ok`, never global freshness); concurrency deferrals stay
+    // `ok` with the held pages listed, and the next run retries them.
+    const managedPurgeFailed = (managedPurge?.failed ?? 0) > 0;
     return {
       phase: 'purge',
-      status: 'ok',
+      status: managedPurgeFailed ? 'fail' : 'ok',
+      ...(managedPurgeFailed ? { error: { class: 'ManagedPurgeFailed', code: 'managed_purge_failed',
+        message: `${managedPurge!.failed} expired page(s) could not be purged through the coordinator: ${managedPurge!.blocked.filter(b => !b.code || !['revision_conflict', 'page_not_found', 'page_identity_changed'].includes(b.code)).slice(0, 3).map(b => `${b.source_id}/${b.slug}: ${b.reason}`).join('; ')}` } } : {}),
       duration_ms: 0,
       summary:
         `purged ${purgedSources.length} source(s)` +
@@ -1792,7 +1798,7 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
         purged_orphan_clone_names: purgedClones.names,
         purged_sources: purgedSources,
         purged_page_slugs: purgedPages.slugs,
-        ...(managedPurge ? { purged_pages_blocked: managedPurge.blocked } : {}),
+        ...(managedPurge ? { purged_pages_blocked: managedPurge.blocked, purged_pages_deferred: managedPurge.deferred, purged_pages_failed: managedPurge.failed } : {}),
         purged_checkpoints_count: purgedCheckpoints,
         purged_brainstorm_checkpoints_count: purgedBrainstormCheckpoints,
         purged_batch_retry_audit_files_count: purgedBatchRetryAuditFiles,

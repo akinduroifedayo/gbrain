@@ -194,21 +194,22 @@ test('managed lint never publishes a repair of older bytes over a newer coordina
     const NEWER = `${PAGE}\nA newer coordinated line.\n`;
     const original = engine.readPageSnapshot;
     let raced = false;
+    // `this`, not `engine`: transaction-scoped clones inherit this override.
     engine.readPageSnapshot = async function (this: BrainEngine, slug, opts) {
-      if (!raced && slug === 'people/jane-doe') {
+      if (!raced && this === engine && slug === 'people/jane-doe') {
         raced = true;
-        engine.readPageSnapshot = original;
-        const a = (await original.call(engine, slug, opts))!;
+        delete (engine as Partial<BrainEngine>).readPageSnapshot;
+        const a = (await original.call(this, slug, opts))!;
         await submitPageMutation(ctx, { operation: 'put_page', params: { slug, content: NEWER,
           expected_revision: a.revision, request_id: randomUUID() } });
       }
-      return original.call(engine, slug, opts);
+      return original.call(this, slug, opts);
     };
     let first;
     try {
       first = await runLintCore({ target: root, fix: true, engine, sourceId });
     } finally {
-      engine.readPageSnapshot = original;
+      delete (engine as Partial<BrainEngine>).readPageSnapshot;
     }
     expect(raced).toBe(true);
     // Revision B survives in the index and the canonical file; the stale repair is pending.

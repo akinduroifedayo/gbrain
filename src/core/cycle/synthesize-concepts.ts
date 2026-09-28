@@ -35,8 +35,9 @@ import { createGlobalLlmHaltTracker, haltedClassOf, type GlobalLlmErrorClass } f
 // source-boost's 1.3× 'concepts/' weighting can actually reach them.
 import { importFromContent } from '../import-file.ts';
 import { serializeMarkdown } from '../markdown.ts';
-import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, replaceOrInsertFactsFence } from '../facts-fence.ts';
-import { TAKES_FENCE_BEGIN, TAKES_FENCE_END } from '../takes-fence.ts';
+import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, parseFactsFence, replaceOrInsertFactsFence } from '../facts-fence.ts';
+import { TAKES_FENCE_BEGIN, TAKES_FENCE_END, parseTakesFence } from '../takes-fence.ts';
+import { parseMarkdown } from '../markdown.ts';
 import { maintenancePreflight, publishMaintenancePage, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
 import { isDbOnly, loadStorageConfig } from '../storage-config.ts';
 import { canonicalLookup, type ModelPricing } from '../model-pricing.ts';
@@ -238,6 +239,15 @@ export async function runPhaseSynthesizeConcepts(
   // rollup halt_delta / round_completed_delta), which a missing edge is not —
   // the narrative was synthesized and persisted as-is. Warn-only.
   const linkWarnings: Array<{ concept: string; warning: string }> = [];
+  // #5484 managed publication outcomes, kept OUT of `failures` (which means
+  // "LLM failed → template fallback"). Deferred: the page moved under a
+  // concurrent writer — transient, the next run retries, so the global lane
+  // must not stamp freshness. Held: the existing page cannot be republished
+  // without losing canonical material (ambiguous fences, an uncoordinated
+  // file edit) — persistent until an operator imports/repairs it; the concept
+  // is left byte-identical and reported, never forced.
+  const publicationDeferred: Array<{ concept: string; reason: string }> = [];
+  const publicationHeld: Array<{ concept: string; reason: string }> = [];
   // #3044 adoption: shared halt policy — auth/billing halt on the first
   // hit, a rate_limit streak halts after 3 consecutive failures, a
   // successful chat call resets the streak.
@@ -287,6 +297,12 @@ export async function runPhaseSynthesizeConcepts(
     ? null : await maintenancePreflight(engine, opts.sourceId ?? 'default', opts.brainDir);
   for (const group of atomGroups) {
     tierCounts[group.tier]++;
+    if (maintenance) {
+      // Decide before any model spend whether the existing page can be
+      // republished at all; an ambiguous original is held, not rewritten.
+      const hold = await conceptPublicationHold(engine, maintenance, `concepts/${group.conceptSlug.split('/').pop()}`);
+      if (hold) { publicationHeld.push({ concept: group.conceptSlug, reason: hold }); continue; }
+    }
     let narrative: string;
     let synthesisMode: ConceptSynthesisMode;
     if (group.tier === 'T1' || group.tier === 'T2') {
@@ -391,8 +407,10 @@ export async function runPhaseSynthesizeConcepts(
           // One concept whose canonical file carries an uncoordinated edit
           // (or changed mid-run) must not stop the phase: record it and move on.
           const code = (err as { code?: string }).code;
-          if (code !== 'source_changed' && code !== 'revision_conflict') throw err;
-          failures.push({ concept: group.conceptSlug, error: `publication refused (${code}): ${(err as Error).message}` });
+          const reason = `${code}: ${(err as Error).message}`;
+          if (code === 'revision_conflict' || code === 'page_identity_changed') publicationDeferred.push({ concept: group.conceptSlug, reason });
+          else if (code === 'source_changed' || code === CONCEPT_PRESERVATION_CODE) publicationHeld.push({ concept: group.conceptSlug, reason });
+          else throw err;
           continue;
         }
       } else {
@@ -478,20 +496,22 @@ export async function runPhaseSynthesizeConcepts(
       kind: 'concepts',
       source_id: opts.sourceId ?? 'default',
       cost_delta: estimatedSpendUsd,
-      round_completed_delta: failures.length === 0 ? 1 : 0,
+      round_completed_delta: failures.length === 0 && publicationDeferred.length === 0 && publicationHeld.length === 0 ? 1 : 0,
       halt_delta: failures.length > 0 ? 1 : 0,
     });
   }
 
   return {
     phase: 'synthesize_concepts',
-    status: failures.length > 0 || linkWarnings.length > 0 ? 'warn' : 'ok',
+    status: failures.length > 0 || linkWarnings.length > 0 || publicationDeferred.length > 0 || publicationHeld.length > 0 ? 'warn' : 'ok',
     duration_ms: 0,
     summary:
       `synthesize_concepts: ${conceptsWritten} concepts ` +
       `(T1=${tierCounts.T1} T2=${tierCounts.T2} T3=${tierCounts.T3})` +
       (failures.length > 0 ? ` (${failures.length} LLM-failed → template fallback)` : '') +
-      (linkWarnings.length > 0 ? ` (${linkWarnings.length} provenance-link warning(s))` : ''),
+      (linkWarnings.length > 0 ? ` (${linkWarnings.length} provenance-link warning(s))` : '') +
+      (publicationDeferred.length > 0 ? ` (${publicationDeferred.length} publication(s) deferred: page changed, retried next run)` : '') +
+      (publicationHeld.length > 0 ? ` (${publicationHeld.length} publication(s) held: existing page needs import/repair)` : ''),
     details: {
       concepts_written: conceptsWritten,
       tier_counts: tierCounts,
@@ -500,6 +520,8 @@ export async function runPhaseSynthesizeConcepts(
       atoms_seen: atoms.length,
       failures,
       link_warnings: linkWarnings,
+      publication_deferred: publicationDeferred,
+      publication_held: publicationHeld,
       ...(abortedGlobalError ? { aborted_global_error: abortedGlobalError } : {}),
       estimated_spend_usd: estimatedSpendUsd,
       budget_usd: budgetCap,
@@ -546,6 +568,8 @@ async function publishManagedConcept(engine: BrainEngine, authority: Maintenance
  */
 export function composeConceptRepublication(page: Pick<Page, 'type' | 'title' | 'compiled_truth' | 'timeline' | 'frontmatter'>,
   tags: string[], synthesized: Record<string, unknown>, narrative: string): string {
+  const hold = conceptPreservationHold(page);
+  if (hold) throw conceptHoldError(hold);
   const body = page.compiled_truth ?? '';
   let compiled = narrative.trim();
   const facts = fenceBlock(body, FACTS_FENCE_BEGIN, FACTS_FENCE_END);
@@ -553,8 +577,51 @@ export function composeConceptRepublication(page: Pick<Page, 'type' | 'title' | 
   const takes = fenceBlock(body, TAKES_FENCE_BEGIN, TAKES_FENCE_END);
   if (takes) compiled = `${compiled}\n\n## Takes\n\n${takes}`;
   const { type: _type, title: _title, tags: _tags, ...kept } = (page.frontmatter ?? {}) as Record<string, unknown>;
-  return serializeMarkdown({ ...kept, ...synthesized }, compiled, (page.timeline ?? '').trim(),
+  const markdown = serializeMarkdown({ ...kept, ...synthesized }, compiled, (page.timeline ?? '').trim(),
     { type: page.type ?? 'concept', title: page.title, tags });
+  // Post-condition: the republished page carries exactly the canonical rows
+  // and timeline the original carried. Anything else is a hold, not a write.
+  const out = parseMarkdown(markdown, 'concept');
+  if (JSON.stringify(canonicalRows(out.compiled_truth)) !== JSON.stringify(canonicalRows(body))
+    || (out.timeline ?? '').trim() !== (page.timeline ?? '').trim()) {
+    throw conceptHoldError('CONCEPT_REPUBLICATION_LOSSY: composed page would not preserve the existing fences or timeline');
+  }
+  return markdown;
+}
+
+/** Error code for a concept held because republication could lose canonical material. */
+export const CONCEPT_PRESERVATION_CODE = 'concept_preservation_hold';
+function conceptHoldError(message: string): Error { return Object.assign(new Error(message), { code: CONCEPT_PRESERVATION_CODE }); }
+
+function canonicalRows(body: string): { facts: unknown[]; takes: unknown[] } {
+  return { facts: parseFactsFence(body).facts, takes: parseTakesFence(body).takes };
+}
+
+/**
+ * Why an existing concept page cannot be republished losslessly, or null.
+ * Republication rewrites the narrative and carries the page's `## Facts` /
+ * `## Takes` fences over verbatim; that is only safe when each fence occurs at
+ * most once, is balanced, parses without warnings, and sits above the
+ * timeline sentinel. Anything else is ambiguous: the concept is held and its
+ * bytes and index are left untouched. Pure: exported for tests.
+ */
+export function conceptPreservationHold(page: Pick<Page, 'compiled_truth' | 'timeline'>): string | null {
+  const body = page.compiled_truth ?? '';
+  const timeline = page.timeline ?? '';
+  for (const [name, begin, end] of [['FACTS', FACTS_FENCE_BEGIN, FACTS_FENCE_END], ['TAKES', TAKES_FENCE_BEGIN, TAKES_FENCE_END]] as const) {
+    if (timeline.includes(begin) || timeline.includes(end)) return `CONCEPT_${name}_FENCE_BELOW_SENTINEL: a ${name.toLowerCase()} fence marker sits in the timeline`;
+    const begins = body.split(begin).length - 1, ends = body.split(end).length - 1;
+    if (begins > 1 || ends > 1) return `CONCEPT_${name}_FENCE_DUPLICATE: more than one ${name.toLowerCase()} fence`;
+    if (begins !== ends) return `CONCEPT_${name}_FENCE_UNBALANCED: ${name.toLowerCase()} fence begin/end markers do not pair`;
+  }
+  const warnings = [...parseFactsFence(body).warnings, ...parseTakesFence(body).warnings];
+  return warnings.length ? `CONCEPT_FENCE_UNPARSEABLE: ${warnings[0]}` : null;
+}
+
+/** Pre-model check: an existing live concept whose original is ambiguous is held. */
+async function conceptPublicationHold(engine: BrainEngine, authority: MaintenanceAuthority, slug: string): Promise<string | null> {
+  const snapshot = await engine.readPageSnapshot(slug, { sourceId: authority.writer.sourceId, includeDeleted: true });
+  return snapshot && !snapshot.page.deleted_at ? conceptPreservationHold(snapshot.page) : null;
 }
 
 function fenceBlock(body: string, begin: string, end: string): string | null {

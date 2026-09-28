@@ -3,13 +3,27 @@ import type { BrainEngine } from '../engine.ts';
 import { loadConfig } from '../config.ts';
 import { submitPageMutation } from '../persistence/page-mutations.ts';
 
+/** A tombstone that moved under a concurrent writer; the next run retries it. */
+const DEFERRAL_CODES = new Set(['revision_conflict', 'page_not_found', 'page_identity_changed']);
+
+export interface ManagedPurgeResult {
+  slugs: string[];
+  count: number;
+  /** Every tombstone not purged this run, with its reason (deferred + failed). */
+  blocked: Array<{ source_id: string; slug: string; reason: string; code: string | null }>;
+  /** Benign concurrency deferrals (page changed/restored/gone mid-run). */
+  deferred: number;
+  /** Operational failures (owner/binding/storage/protocol). The phase must not report success. */
+  failed: number;
+}
+
 /**
  * #5484: coordinated purge of expired tombstones on a managed brain. Pages in
  * archived sources are left to the source-lifecycle purge. A page that cannot
- * be purged (owner unavailable, revision moved) is reported, never forced.
+ * be purged is reported, never forced; concurrency deferrals are separated
+ * from operational failures so the caller can report the phase truthfully.
  */
-export async function purgeExpiredPagesManaged(engine: BrainEngine, olderThanHours: number):
-  Promise<{ slugs: string[]; count: number; blocked: Array<{ source_id: string; slug: string; reason: string }> }> {
+export async function purgeExpiredPagesManaged(engine: BrainEngine, olderThanHours: number): Promise<ManagedPurgeResult> {
   const hours = Math.max(0, Math.floor(olderThanHours));
   const rows = await engine.executeRaw<{ source_id: string; slug: string }>(
     `SELECT p.source_id, p.slug FROM pages p JOIN sources s ON s.id = p.source_id
@@ -17,7 +31,8 @@ export async function purgeExpiredPagesManaged(engine: BrainEngine, olderThanHou
       ORDER BY p.deleted_at ASC, p.source_id ASC, p.slug ASC`, [String(hours)]);
   const config = loadConfig() ?? { engine: engine.kind };
   const slugs: string[] = [];
-  const blocked: Array<{ source_id: string; slug: string; reason: string }> = [];
+  const blocked: ManagedPurgeResult['blocked'] = [];
+  let deferred = 0, failed = 0;
   for (const row of rows) {
     try {
       const snapshot = await engine.readPageSnapshot(row.slug, { sourceId: row.source_id, includeDeleted: true });
@@ -28,8 +43,10 @@ export async function purgeExpiredPagesManaged(engine: BrainEngine, olderThanHou
           expected_revision: snapshot.revision, request_id: randomUUID() } });
       slugs.push(row.slug);
     } catch (error) {
-      blocked.push({ ...row, reason: error instanceof Error ? error.message : String(error) });
+      const code = typeof (error as { code?: unknown })?.code === 'string' ? (error as { code: string }).code : null;
+      if (code && DEFERRAL_CODES.has(code)) deferred++; else failed++;
+      blocked.push({ ...row, code, reason: error instanceof Error ? error.message : String(error) });
     }
   }
-  return { slugs, count: slugs.length, blocked };
+  return { slugs, count: slugs.length, blocked, deferred, failed };
 }
