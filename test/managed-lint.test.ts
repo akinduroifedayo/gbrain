@@ -194,14 +194,20 @@ test('managed lint never publishes a repair of older bytes over a newer coordina
     const NEWER = `${PAGE}\nA newer coordinated line.\n`;
     const original = engine.readPageSnapshot;
     let raced = false;
-    // `this`, not `engine`: transaction-scoped clones inherit this override.
+    // Only lint's own read races: the persistence consumer (embedding
+    // effects) reads through the same engine object and must not consume the
+    // one-shot hook. `this`, not `engine`: transaction clones inherit it.
     engine.readPageSnapshot = async function (this: BrainEngine, slug, opts) {
-      if (!raced && this === engine && slug === 'people/jane-doe') {
+      const caller = new Error().stack?.split('\n')[2] ?? '';
+      if (!raced && this === engine && slug === 'people/jane-doe' && caller.includes('commands/lint.ts')) {
         raced = true;
         delete (engine as Partial<BrainEngine>).readPageSnapshot;
         const a = (await original.call(this, slug, opts))!;
-        await submitPageMutation(ctx, { operation: 'put_page', params: { slug, content: NEWER,
-          expected_revision: a.revision, request_id: randomUUID() } });
+        // B must be committed before lint continues; under load the default
+        // receipt wait can return pending, which would reorder the race.
+        const b = await submitPageMutation(ctx, { operation: 'put_page', params: { slug, content: NEWER,
+          expected_revision: a.revision, request_id: randomUUID() }, waitMs: 60_000 });
+        expect(b).toMatchObject({ state: 'committed' });
       }
       return original.call(this, slug, opts);
     };
