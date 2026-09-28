@@ -15,6 +15,8 @@ export interface ManagedPurgeResult {
   deferred: number;
   /** Operational failures (owner/binding/storage/protocol). The phase must not report success. */
   failed: number;
+  /** Set when `failed > 0`: the purge phase fails (no global freshness); deferrals alone stay ok. */
+  error?: { class: string; code: string; message: string };
 }
 
 /**
@@ -48,5 +50,8 @@ export async function purgeExpiredPagesManaged(engine: BrainEngine, olderThanHou
       blocked.push({ ...row, code, reason: error instanceof Error ? error.message : String(error) });
     }
   }
-  return { slugs, count: slugs.length, blocked, deferred, failed };
+  const error = failed > 0 ? { class: 'ManagedPurgeFailed', code: 'managed_purge_failed',
+    message: `${failed} expired page(s) could not be purged through the coordinator: ${blocked.filter(b => !b.code || !DEFERRAL_CODES.has(b.code))
+      .slice(0, 3).map(b => `${b.source_id}/${b.slug}: ${b.reason}`).join('; ')}` } : undefined;
+  return { slugs, count: slugs.length, blocked, deferred, failed, ...(error ? { error } : {}) };
 }

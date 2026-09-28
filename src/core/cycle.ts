@@ -1771,15 +1771,9 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
     } catch {
       // Non-fatal.
     }
-    // #5484: an operational failure purging a managed tombstone is a failed
-    // phase (never `ok`, never global freshness); concurrency deferrals stay
-    // `ok` with the held pages listed, and the next run retries them.
-    const managedPurgeFailed = (managedPurge?.failed ?? 0) > 0;
     return {
       phase: 'purge',
-      status: managedPurgeFailed ? 'fail' : 'ok',
-      ...(managedPurgeFailed ? { error: { class: 'ManagedPurgeFailed', code: 'managed_purge_failed',
-        message: `${managedPurge!.failed} expired page(s) could not be purged through the coordinator: ${managedPurge!.blocked.filter(b => !b.code || !['revision_conflict', 'page_not_found', 'page_identity_changed'].includes(b.code)).slice(0, 3).map(b => `${b.source_id}/${b.slug}: ${b.reason}`).join('; ')}` } } : {}),
+      status: managedPurge?.error ? 'fail' : 'ok', ...(managedPurge?.error ? { error: managedPurge.error } : {}), // #5484: no freshness
       duration_ms: 0,
       summary:
         `purged ${purgedSources.length} source(s)` +

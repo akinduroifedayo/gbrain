@@ -2805,12 +2805,7 @@ export async function registerBuiltinHandlers(
 
     if ((report.status === 'ok' || report.status === 'clean' || report.status === 'partial')
       && !report.phases.some(phase => {
-        if (phase.status === 'fail') return true;
-        // #5484: a concept publication deferred by a concurrent writer is
-        // unfinished work the next run must retry, not freshness.
-        if (phase.phase === 'synthesize_concepts') {
-          return Array.isArray(phase.details.publication_deferred) && phase.details.publication_deferred.length > 0;
-        }
+        if (phase.status === 'fail' || (phase.phase === 'synthesize_concepts' && (phase.details.publication_deferred as unknown[] | undefined)?.length)) return true; // #5484: deferred concept work is not freshness
         if (phase.phase !== 'synthesize' && phase.phase !== 'patterns') return false;
         if (phase.details.reason === 'insufficient_cycle_budget') return true;
         if (phase.phase === 'patterns') {
